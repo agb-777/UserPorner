@@ -8,6 +8,9 @@
 
 Scrape the video list of an Eporner profile into CSV, JSON, Markdown, or PDF.
 
+- **Author:** agb-777
+- **Homepage:** https://github.com/agb-777/userporner
+
 ## Install
 
 Core dependencies:
