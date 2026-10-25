@@ -3,32 +3,37 @@ import csv
 import json
 import re
 import sys
-import time
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from colorama import init, Fore, Style
+from colorama import Fore, Style, init
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-from webdriver_manager.chrome import ChromeDriverManager
 
 init(autoreset=True)
 
-_print_lock = threading.Lock()
-_tls = threading.local()
-_drivers = []
-_drivers_lock = threading.Lock()
-_VERBOSE = 0
-_checkpoint_broken = False
-
-LOG_COLORS = {
+DEFAULT_CHECKPOINT = ".scraper_checkpoint.json"
+PROFILE_RE = re.compile(r"https?://(?:www\.)?eporner\.com/profile/([^/?#]+)", re.IGNORECASE)
+PAGE_RE = re.compile(r"/uploaded-videos/(\d+)(?:[/?#]|$)")
+VIDEO_SELECTOR = 'a[href*="/video-"]'
+CONTAINER_SELECTOR = ".mb"
+PAGE_LOAD_TIMEOUT = 30
+RENDER_TIMEOUT = 15
+RETRY_DELAY = 2
+SAFETY_PAGE_LIMIT = 100000
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+COLORS = {
     "info": Fore.CYAN,
     "success": Fore.GREEN,
     "warn": Fore.YELLOW,
@@ -37,500 +42,311 @@ LOG_COLORS = {
     "dim": Fore.WHITE,
 }
 
-DEFAULT_CHECKPOINT = ".scraper_checkpoint.json"
-PROFILE_URL_PATTERN = re.compile(
-    r"https?://(?:www\.)?eporner\.com/profile/([^/?#]+)", re.IGNORECASE
-)
-PAGE_NUM_PATTERN = re.compile(r"/uploaded-videos/(\d+)(?:[/?#]|$)")
-SAFETY_PAGE_LIMIT = 100000
-TICKER_INTERVAL = 5
+_print_lock = threading.Lock()
+_tls = threading.local()
+_drivers = []
+_drivers_lock = threading.Lock()
+_closing = threading.Event()
+_verbose = False
 
 
 def log(msg, level="info"):
-    color = LOG_COLORS.get(level, Fore.WHITE)
+    ts = datetime.now().strftime("%H:%M:%S")
     with _print_lock:
-        ts = datetime.now().strftime("%H:%M:%S")
-        try:
-            print(f"{color}[{ts}] {msg}{Style.RESET_ALL}", flush=True)
-        except Exception:
-            pass
-
-
-def vlog(msg, min_level=1, level="info"):
-    if _VERBOSE >= min_level:
-        log(msg, level)
-
-
-class ProgressTicker:
-    def __init__(self, total, label, interval=TICKER_INTERVAL):
-        self.total = total
-        self.label = label
-        self.interval = interval
-        self.done = 0
-        self._stop = threading.Event()
-        self._lock = threading.Lock()
-        self._thread = None
-
-    def __enter__(self):
-        if self.total > 0:
-            self._thread = threading.Thread(target=self._loop, daemon=True)
-            self._thread.start()
-        return self
-
-    def __exit__(self, *exc):
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2)
-
-    def _loop(self):
-        while not self._stop.wait(self.interval):
-            try:
-                with self._lock:
-                    done = self.done
-                remaining = self.total - done
-                if remaining > 0:
-                    log(f"{self.label}: {done}/{self.total} done, {remaining} remaining")
-            except Exception:
-                pass
-
-    def update(self):
-        with self._lock:
-            self.done += 1
+        print(f"{COLORS.get(level, Fore.WHITE)}[{ts}] {msg}{Style.RESET_ALL}", flush=True)
 
 
 def build_options():
     opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--log-level=3")
+    for arg in (
+        "--headless=new",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--window-size=1920,1080",
+        "--disable-blink-features=AutomationControlled",
+        "--log-level=3",
+        f"user-agent={USER_AGENT}",
+    ):
+        opts.add_argument(arg)
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
     return opts
 
 
 def new_driver():
-    return webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
-        options=build_options(),
-    )
+    driver = webdriver.Chrome(options=build_options())
+    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+    with _drivers_lock:
+        _drivers.append(driver)
+    return driver
 
 
-def worker_driver():
-    if not hasattr(_tls, "driver"):
-        d = new_driver()
-        with _drivers_lock:
-            _drivers.append(d)
-        _tls.driver = d
-    return _tls.driver
+def quit_driver(driver):
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    with _drivers_lock:
+        if driver in _drivers:
+            _drivers.remove(driver)
 
 
-def drop_worker_driver():
-    if hasattr(_tls, "driver"):
-        d = _tls.driver
-        del _tls.driver
-        try:
-            d.quit()
-        except Exception as exc:
-            vlog(f"Driver quit failed: {exc}", min_level=1, level="dim")
-        with _drivers_lock:
-            try:
-                _drivers.remove(d)
-            except ValueError:
-                pass
+def thread_driver():
+    if _closing.is_set():
+        raise RuntimeError("proses sedang dihentikan")
+    driver = getattr(_tls, "driver", None)
+    if driver is None:
+        driver = new_driver()
+        _tls.driver = driver
+    return driver
+
+
+def discard_thread_driver():
+    driver = getattr(_tls, "driver", None)
+    if driver is not None:
+        _tls.driver = None
+        quit_driver(driver)
 
 
 def close_all_drivers():
+    _closing.set()
     with _drivers_lock:
         drivers = list(_drivers)
-        _drivers.clear()
-    for d in drivers:
-        try:
-            d.quit()
-        except Exception as exc:
-            vlog(f"Driver quit failed during cleanup: {exc}", min_level=1, level="dim")
+    for driver in drivers:
+        quit_driver(driver)
 
 
-def _title_of(anchor):
-    try:
-        t = (anchor.get_attribute("title") or "").strip()
-        if t:
-            return t
-    except Exception:
-        pass
-    try:
-        img = anchor.find_element(By.TAG_NAME, "img")
-        alt = (img.get_attribute("alt") or "").strip()
+def page_url(base, n):
+    return base if n == 1 else f"{base}{n}/"
+
+
+def page_number_from(url):
+    m = PAGE_RE.search(url or "")
+    return int(m.group(1)) if m else 1
+
+
+def normalize_profile_url(raw):
+    m = PROFILE_RE.search(raw)
+    return f"https://www.eporner.com/profile/{m.group(1)}/uploaded-videos/" if m else None
+
+
+def wait_for_videos(driver):
+    WebDriverWait(driver, RENDER_TIMEOUT).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, VIDEO_SELECTOR))
+    )
+
+
+def page_is_empty(driver):
+    return not (
+        driver.find_elements(By.CSS_SELECTOR, CONTAINER_SELECTOR)
+        or driver.find_elements(By.CSS_SELECTOR, VIDEO_SELECTOR)
+    )
+
+
+def title_of(anchor):
+    title = (anchor.get_attribute("title") or "").strip()
+    if title:
+        return title
+    imgs = anchor.find_elements(By.TAG_NAME, "img")
+    if imgs:
+        alt = (imgs[0].get_attribute("alt") or "").strip()
         if alt:
             return alt
-    except Exception:
-        pass
-    try:
-        return (anchor.text or "").strip()
-    except Exception:
-        return ""
+    return (anchor.text or "").strip()
 
 
-def extract_videos(driver, page_label=None):
-    by_url = {}
-    fail_count = 0
+def extract_videos(driver):
+    anchors = []
+    for container in driver.find_elements(By.CSS_SELECTOR, CONTAINER_SELECTOR):
+        anchors.extend(container.find_elements(By.CSS_SELECTOR, VIDEO_SELECTOR))
+    if not anchors:
+        anchors = driver.find_elements(By.CSS_SELECTOR, VIDEO_SELECTOR)
 
-    try:
-        containers = driver.find_elements(By.CSS_SELECTOR, ".mb")
-    except Exception as exc:
-        log(f"Could not query .mb containers: {exc}", "warn")
-        containers = []
-
-    scoped = []
-    if containers:
-        for c in containers:
-            try:
-                scoped.extend(c.find_elements(By.CSS_SELECTOR, 'a[href*="/video-"]'))
-            except Exception:
-                fail_count += 1
-                continue
-
-    if scoped:
-        anchors = scoped
-    else:
+    found = {}
+    for anchor in anchors:
         try:
-            anchors = driver.find_elements(By.CSS_SELECTOR, 'a[href*="/video-"]')
-        except Exception as exc:
-            log(f"Could not query video anchors: {exc}", "warn")
-            return []
-        if anchors:
-            log("Scoped extraction empty; using global anchor scan.", "warn")
-
-    for a in anchors:
-        try:
-            url = a.get_attribute("href")
-            if not url or "/video-" not in url:
-                continue
-            if url in by_url and by_url[url]:
-                continue
-            title = _title_of(a)
-            if title:
-                by_url[url] = title
-                if page_label is not None:
-                    vlog(f"  [{page_label}] {title[:70]}", min_level=2, level="dim")
-            else:
-                by_url.setdefault(url, "")
-        except Exception:
-            fail_count += 1
+            url = anchor.get_attribute("href") or ""
+            title = title_of(anchor)
+        except WebDriverException:
             continue
-
-    if fail_count > 0:
-        vlog(
-            f"  [{page_label or '?'}] {fail_count} element(s) failed extraction",
-            min_level=1,
-            level="warn",
-        )
-
-    return [{"title": t, "url": u} for u, t in by_url.items()]
+        if "/video-" not in url:
+            continue
+        if url not in found or (title and not found[url]):
+            found[url] = title
+    return [{"title": t, "url": u} for u, t in found.items()]
 
 
-def _page_is_empty(driver):
+def load_listing(driver, url):
+    driver.get(url)
+    if page_number_from(driver.current_url) != page_number_from(url):
+        return []
     try:
-        if driver.find_elements(By.CSS_SELECTOR, ".mb"):
-            return False
-        if driver.find_elements(By.CSS_SELECTOR, 'a[href*="/video-"]'):
-            return False
-        return True
-    except Exception:
-        return False
+        wait_for_videos(driver)
+    except TimeoutException:
+        return [] if page_is_empty(driver) else None
+    return extract_videos(driver)
 
 
-def fetch_page(url, retries, page_label=None):
+def fetch_page(url, retries):
     for attempt in range(1, retries + 1):
         try:
-            d = worker_driver()
-            d.set_page_load_timeout(30)
-            d.get(url)
-            try:
-                WebDriverWait(d, 15).until(
-                    EC.presence_of_element_located(
-                        (By.CSS_SELECTOR, 'a[href*="/video-"]')
-                    )
-                )
-            except TimeoutException:
-                if _page_is_empty(d):
-                    log(f"Page is empty (no containers, no anchors): {url}")
-                    return []
-                log(f"Page did not render anchors within 15s: {url}", "warn")
-                return None
-            return extract_videos(d, page_label)
+            videos = load_listing(thread_driver(), url)
+            reason = "halaman tidak tampil"
         except Exception as exc:
-            drop_worker_driver()
-            if attempt < retries:
-                log(
-                    f"Attempt {attempt}/{retries} failed for {url} "
-                    f"({type(exc).__name__}). Retrying.",
-                    "warn",
-                )
-                time.sleep(2)
-            else:
-                log(f"All {retries} attempts failed for {url}: {exc}", "error")
-                return None
+            discard_thread_driver()
+            videos = None
+            reason = type(exc).__name__
+        if videos is not None:
+            return videos
+        if attempt < retries:
+            log(f"Percobaan {attempt}/{retries} gagal ({reason}): {url}", "warn")
+            time.sleep(RETRY_DELAY)
+    log(f"Semua {retries} percobaan gagal: {url}", "error")
     return None
 
 
-def page_url(base_url, n):
-    base = base_url.rstrip("/")
-    return base + "/" if n == 1 else f"{base}/{n}/"
-
-
-def _max_visible_page(driver):
+def walk_next_links(driver, start_url):
     last = 1
-    try:
-        anchors = driver.find_elements(By.CSS_SELECTOR, 'a[href*="/uploaded-videos/"]')
-    except Exception:
-        return last
-    for a in anchors:
+    url = start_url
+    visited = set()
+    while url and url not in visited and len(visited) < SAFETY_PAGE_LIMIT:
+        visited.add(url)
+        driver.get(url)
         try:
-            href = a.get_attribute("href") or ""
-        except Exception:
-            continue
-        m = PAGE_NUM_PATTERN.search(href)
-        if m:
-            last = max(last, int(m.group(1)))
-    return last
-
-
-def _walk_next_links(driver, start_url):
-    last = 1
-    next_url = start_url
-    seen = set()
-    while next_url and len(seen) < SAFETY_PAGE_LIMIT:
-        if next_url in seen:
-            break
-        seen.add(next_url)
-        m = PAGE_NUM_PATTERN.search(next_url)
-        if not m:
-            break
-        current_page = int(m.group(1))
-        try:
-            driver.get(next_url)
-        except Exception:
-            break
-        try:
-            WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, 'a[href*="/video-"]')
-                )
-            )
+            wait_for_videos(driver)
         except TimeoutException:
             break
-        last = max(last, current_page)
-        try:
-            nxt = driver.find_element(By.CSS_SELECTOR, 'link[rel="next"]')
-            href = nxt.get_attribute("href") or ""
-        except Exception:
-            break
-        if not href:
-            break
-        next_url = href
+        last = max(last, page_number_from(driver.current_url))
+        links = driver.find_elements(By.CSS_SELECTOR, 'link[rel="next"]')
+        url = links[0].get_attribute("href") if links else None
     return last
 
 
-def detect_candidate_last_page(start_url, retries):
-    last_exc = None
+def detect_once(driver, start_url):
+    driver.get(start_url)
+    try:
+        wait_for_videos(driver)
+    except TimeoutException:
+        if page_is_empty(driver):
+            return 1
+        raise
+
+    candidate = 1
+    for link in driver.find_elements(By.CSS_SELECTOR, 'link[rel="last"]'):
+        candidate = max(candidate, page_number_from(link.get_attribute("href")))
+    for anchor in driver.find_elements(By.CSS_SELECTOR, 'a[href*="/uploaded-videos/"]'):
+        candidate = max(candidate, page_number_from(anchor.get_attribute("href")))
+
+    if candidate == 1:
+        log("Tidak ada penanda halaman terakhir, menelusuri rel=next satu per satu (bisa lambat).", "warn")
+        candidate = walk_next_links(driver, start_url)
+    return min(candidate, SAFETY_PAGE_LIMIT)
+
+
+def detect_last_page(start_url, retries):
     for attempt in range(1, retries + 1):
         try:
-            d = new_driver()
+            return detect_once(thread_driver(), start_url)
         except Exception as exc:
-            last_exc = exc
-            log(
-                f"Driver creation failed (attempt {attempt}/{retries}): "
-                f"{type(exc).__name__}: {exc}",
-                "warn",
-            )
-            if attempt < retries:
-                time.sleep(3)
-                continue
-            raise RuntimeError(f"Could not create driver: {last_exc}") from last_exc
+            discard_thread_driver()
+            if attempt == retries:
+                raise
+            log(f"Deteksi halaman terakhir gagal ({attempt}/{retries}): {type(exc).__name__}", "warn")
+            time.sleep(RETRY_DELAY)
 
+
+class Store:
+    def __init__(self, path, source_url):
+        self.path = Path(path)
+        self.source_url = source_url
+        self.videos = []
+        self.urls = set()
+        self.pages_done = set()
+
+    def load(self):
+        if not self.path.exists():
+            return
         try:
-            d.set_page_load_timeout(30)
-            d.get(start_url)
-            try:
-                WebDriverWait(d, 20).until(
-                    EC.presence_of_element_located(
-                        (By.CSS_SELECTOR, 'a[href*="/video-"]')
-                    )
-                )
-            except TimeoutException:
-                if _page_is_empty(d):
-                    log("Page 1 is empty.", "warn")
-                    return 1
-                last_exc = TimeoutException("Page 1 anchors did not appear in 20s")
-                if attempt < retries:
-                    log(f"Page 1 attempt {attempt} timed out. Retrying.", "warn")
-                    time.sleep(2)
-                    continue
-                raise last_exc
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            log(f"Checkpoint tidak bisa dibaca ({exc}), mulai dari awal.", "warn")
+            return
+        if not isinstance(data, dict) or data.get("source_url") != self.source_url:
+            log("Checkpoint milik URL lain atau rusak, diabaikan.", "warn")
+            return
+        for v in data.get("videos", []):
+            if isinstance(v, dict) and isinstance(v.get("url"), str) and isinstance(v.get("title"), str) and v["url"]:
+                if v["url"] not in self.urls:
+                    self.urls.add(v["url"])
+                    self.videos.append({"title": v["title"], "url": v["url"]})
+        for n in data.get("pages_done", []):
+            if isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= SAFETY_PAGE_LIMIT:
+                self.pages_done.add(n)
+        if self.videos:
+            log(f"Melanjutkan dengan {len(self.videos)} video dari {len(self.pages_done)} halaman")
 
-            candidate = 1
+    def add_page(self, page, videos):
+        added = 0
+        for v in videos:
+            if v["url"] not in self.urls:
+                self.urls.add(v["url"])
+                self.videos.append(v)
+                added += 1
+        self.pages_done.add(page)
+        self.save()
+        return added
 
-            try:
-                link = d.find_element(By.CSS_SELECTOR, 'link[rel="last"]')
-                href = link.get_attribute("href") or ""
-                m = PAGE_NUM_PATTERN.search(href)
-                if m:
-                    candidate = max(candidate, int(m.group(1)))
-            except NoSuchElementException:
-                pass
-
-            candidate = max(candidate, _max_visible_page(d))
-
-            if candidate == 1:
-                log(
-                    "No last-page marker or visible pagination; "
-                    "walking rel=next sequentially (this may be slow).",
-                    "warn",
-                )
-                candidate = _walk_next_links(d, start_url)
-                log(f"Sequential walk found last page: {candidate}")
-
-            candidate = min(candidate, SAFETY_PAGE_LIMIT)
-            vlog(f"Detection candidate last page = {candidate}", min_level=1)
-            return candidate
-        except Exception as exc:
-            last_exc = exc
-            if attempt < retries:
-                log(f"detect_candidate_last_page attempt {attempt} failed: {exc}", "warn")
-                time.sleep(2)
-            continue
-        finally:
-            try:
-                d.quit()
-            except Exception as exc:
-                vlog(f"Driver quit failed in detect: {exc}", min_level=1, level="dim")
-    raise RuntimeError(f"detect_candidate_last_page failed: {last_exc}")
-
-
-def load_checkpoint(path, source_url):
-    p = Path(path)
-    if not p.exists():
-        return [], set()
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except Exception as exc:
-        log(f"Checkpoint unreadable ({exc}); starting fresh.", "warn")
-        return [], set()
-    if not isinstance(data, dict):
-        log("Checkpoint has invalid top-level structure; starting fresh.", "warn")
-        return [], set()
-    if data.get("source_url") != source_url:
-        log("Checkpoint belongs to a different source URL; ignoring.", "warn")
-        return [], set()
-
-    raw_videos = data.get("videos", [])
-    raw_pages = data.get("pages_done", [])
-
-    if not isinstance(raw_videos, list) or not isinstance(raw_pages, list):
-        log("Checkpoint has invalid data types; starting fresh.", "warn")
-        return [], set()
-
-    valid_videos = []
-    dropped_v = 0
-    for v in raw_videos:
-        if (
-            isinstance(v, dict)
-            and isinstance(v.get("url"), str)
-            and isinstance(v.get("title"), str)
-            and v["url"]
-        ):
-            valid_videos.append({"title": v["title"], "url": v["url"]})
-        else:
-            dropped_v += 1
-    if dropped_v:
-        log(f"Checkpoint: dropped {dropped_v} malformed video entries.", "warn")
-
-    valid_pages = set()
-    dropped_p = 0
-    for p_ in raw_pages:
+    def save(self):
+        payload = {
+            "source_url": self.source_url,
+            "videos": self.videos,
+            "pages_done": sorted(self.pages_done),
+            "timestamp": datetime.now().isoformat(),
+        }
+        tmp = self.path.with_name(self.path.name + ".tmp")
         try:
-            n = int(p_)
-        except (TypeError, ValueError):
-            dropped_p += 1
-            continue
-        if 1 <= n <= SAFETY_PAGE_LIMIT:
-            valid_pages.add(n)
-        else:
-            dropped_p += 1
-    if dropped_p:
-        log(f"Checkpoint: dropped {dropped_p} out-of-range page entries.", "warn")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(self.path)
+        except OSError as exc:
+            log(f"Checkpoint gagal disimpan ({exc}); resume mungkin tidak tersedia.", "warn")
 
-    return valid_videos, valid_pages
+    def remove(self):
+        self.path.unlink(missing_ok=True)
 
 
-def save_checkpoint(path, source_url, videos, pages_done):
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".tmp")
-    payload = {
-        "source_url": source_url,
-        "videos": videos,
-        "pages_done": sorted(pages_done),
-        "timestamp": datetime.now().isoformat(),
-    }
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(p)
+def record_page(store, page, videos):
+    added = store.add_page(page, videos)
+    log(f"Halaman {page}: +{added}, total {len(store.videos)}", "success")
 
 
-def save_checkpoint_safe(path, source_url, videos, pages_done):
-    global _checkpoint_broken
-    if _checkpoint_broken:
-        return
-    try:
-        save_checkpoint(path, source_url, videos, pages_done)
-    except Exception as exc:
-        _checkpoint_broken = True
-        log(
-            f"Checkpoint save failed ({type(exc).__name__}: {exc}); "
-            f"resume disabled for this run.",
-            "warn",
-        )
+def fetch_and_record(store, base, page, retries):
+    videos = fetch_page(page_url(base, page), retries)
+    if videos is None:
+        return False
+    record_page(store, page, videos)
+    return True
 
 
-def add_unique(videos, seen_urls, target):
-    added = 0
-    for v in videos:
-        if v["url"] not in seen_urls:
-            seen_urls.add(v["url"])
-            target.append(v)
-            added += 1
-    return added
-
-
-def fetch_range_parallel(base_url, pages, retries, workers, label):
+def fetch_parallel(base, pages, retries, workers):
     results = {}
-    if not pages:
-        return results
-    submit_time = {}
-    with ProgressTicker(len(pages), label) as ticker:
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = {}
-            for n in pages:
-                submit_time[n] = time.time()
-                futures[ex.submit(fetch_page, page_url(base_url, n), retries, f"p{n}")] = n
-            for fut in as_completed(futures):
-                n = futures[fut]
-                try:
-                    results[n] = fut.result()
-                except Exception as exc:
-                    log(f"Page {n} raised {type(exc).__name__}: {exc}", "error")
-                    results[n] = None
-                elapsed = time.time() - submit_time[n]
-                vlog(f"Page {n} finished in {elapsed:.1f}s", min_level=1)
-                ticker.update()
+    started = {}
+    executor = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {}
+        for n in pages:
+            started[n] = time.monotonic()
+            futures[executor.submit(fetch_page, page_url(base, n), retries)] = n
+        for future in as_completed(futures):
+            n = futures[future]
+            try:
+                results[n] = future.result()
+            except Exception:
+                results[n] = None
+            if _verbose:
+                log(f"Halaman {n} selesai dalam {time.monotonic() - started[n]:.1f}s", "dim")
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
     return results
 
 
@@ -540,312 +356,205 @@ def shape_records(videos, fields):
     return [{"title": v["title"], "url": v["url"]} for v in videos]
 
 
-def write_csv(path, records, fieldnames):
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".tmp")
-    with open(tmp, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        w.writerows(records)
-    tmp.replace(p)
-
-
-def write_json(path, records, metadata):
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".tmp")
-    payload = dict(metadata)
-    payload["records"] = records
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(p)
-
-
-def save_output(path, fmt, records, fieldnames, metadata):
-    try:
-        if fmt == "csv":
-            write_csv(path, records, fieldnames)
-        elif fmt == "json":
-            write_json(path, records, metadata)
-        else:
-            raise ValueError(f"Unsupported format: {fmt}")
-    except Exception as exc:
-        log(f"CRITICAL: failed to save output to {path}: {type(exc).__name__}: {exc}", "error")
-        raise
-
-
-def resolve_output_path(raw, fmt):
+def output_path(raw, fmt):
     p = Path(raw)
     if p.suffix.lower() != f".{fmt}":
-        p = p.with_suffix(f".{fmt}")
+        p = p.with_name(p.name + f".{fmt}")
     return p
 
 
-def validate_output_path(path):
-    parent = Path(path).parent
-    parent.mkdir(parents=True, exist_ok=True)
-    probe = parent / ".scraper_write_probe"
+def check_writable(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    probe = path.parent / ".write_probe"
     try:
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink()
-    except Exception as exc:
-        raise ValueError(f"Output directory not writable: {parent} ({exc})")
+        probe.write_text("", encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"folder output tidak bisa ditulis: {path.parent} ({exc})")
+    finally:
+        probe.unlink(missing_ok=True)
 
 
-def normalize_profile_url(raw):
-    m = PROFILE_URL_PATTERN.search(raw)
-    if not m:
-        return None
-    return f"https://www.eporner.com/profile/{m.group(1)}/uploaded-videos/"
+def write_output(path, fmt, records, fieldnames, metadata):
+    tmp = path.with_name(path.name + ".tmp")
+    if fmt == "csv":
+        with tmp.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(records)
+    else:
+        payload = {**metadata, "records": records}
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Eporner profile video scraper",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "-u", "--url",
-        required=True,
-        help="Eporner profile URL (auto-normalized to /uploaded-videos/)",
-    )
-    parser.add_argument("-o", "--output", default="output", help="Output file path")
-    parser.add_argument(
-        "-f", "--format", choices=["csv", "json"], default="csv", help="Output format"
-    )
-    parser.add_argument(
-        "-F", "--fields",
-        choices=["all", "url"],
-        default="all",
-        help="Fields to save (all = title+url, url = url only)",
-    )
-    parser.add_argument("-w", "--workers", type=int, default=3, help="Parallel workers (1-10)")
-    parser.add_argument("-r", "--retries", type=int, default=3, help="Retries per page (1-10)")
-    parser.add_argument(
-        "-c", "--checkpoint", default=DEFAULT_CHECKPOINT, help="Checkpoint file path"
-    )
-    parser.add_argument("-n", "--no-resume", action="store_true", help="Ignore existing checkpoint")
-    parser.add_argument(
-        "-k", "--keep-checkpoint",
-        action="store_true",
-        help="Keep checkpoint file after successful run",
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="count",
-        default=0,
-        help="Increase verbosity (-v page timings, -vv per-video extraction)",
-    )
-    args = parser.parse_args()
-
-    normalized = normalize_profile_url(args.url)
-    if not normalized:
-        parser.error("-u/--url must be an eporner.com/profile/<username> URL")
-    args.url = normalized
-
-    if args.workers < 1 or args.workers > 10:
-        parser.error("-w/--workers must be between 1 and 10")
-    if args.retries < 1 or args.retries > 10:
-        parser.error("-r/--retries must be between 1 and 10")
-    return args
+@dataclass
+class Result:
+    records: list
+    out_path: Path
+    fieldnames: list
+    elapsed: float
+    complete: bool
 
 
 def run(args):
-    global _VERBOSE, _checkpoint_broken
-    _VERBOSE = args.verbose
-    _checkpoint_broken = False
-
-    start = time.time()
+    start = time.monotonic()
     fieldnames = ["url"] if args.fields == "url" else ["title", "url"]
+    out_path = output_path(args.output, args.format)
+    check_writable(out_path)
 
-    if args.no_resume and Path(args.checkpoint).exists():
-        try:
-            Path(args.checkpoint).unlink()
-        except Exception as exc:
-            log(f"Could not remove checkpoint: {exc}", "warn")
+    checkpoint = Path(args.checkpoint)
+    if args.no_resume:
+        checkpoint.unlink(missing_ok=True)
 
-    out_path = resolve_output_path(args.output, args.format)
-    validate_output_path(out_path)
+    store = Store(checkpoint, args.url)
+    store.load()
 
     log(f"Target: {args.url}", "step")
-    log(
-        f"Config: format={args.format}, fields={args.fields}, "
-        f"workers={args.workers}, retries={args.retries}, verbose={args.verbose}"
-    )
+    log(f"Konfigurasi: format={args.format}, fields={args.fields}, workers={args.workers}, retries={args.retries}")
 
-    all_videos, pages_done = load_checkpoint(args.checkpoint, args.url)
-    if all_videos:
-        log(f"Resuming with {len(all_videos)} videos across {len(pages_done)} pages")
-    seen_urls = {v["url"] for v in all_videos}
-    visited_page_urls = {page_url(args.url, p) for p in pages_done}
+    log("Mendeteksi halaman terakhir...", "step")
+    candidate = detect_last_page(page_url(args.url, 1), args.retries)
+    log(f"Perkiraan halaman terakhir: {candidate}")
 
-    log("Fetching page 1 and detecting candidate last page...", "step")
-    needs_page_one = 1 not in pages_done
-    candidate_last = detect_candidate_last_page(page_url(args.url, 1), args.retries)
+    if 1 not in store.pages_done:
+        if not fetch_and_record(store, args.url, 1, args.retries):
+            raise RuntimeError("halaman 1 gagal setelah beberapa percobaan; checkpoint dipertahankan")
 
-    if needs_page_one:
-        page1 = fetch_page(page_url(args.url, 1), args.retries, "p1")
-        if page1 is None:
-            log("Page 1 failed after retries; aborting run (resumable).", "error")
-            return [], out_path, fieldnames, time.time() - start
-        added = add_unique(page1, seen_urls, all_videos)
-        pages_done.add(1)
-        visited_page_urls.add(page_url(args.url, 1))
-        save_checkpoint_safe(args.checkpoint, args.url, all_videos, pages_done)
-        log(f"Page 1: +{added}, total {len(all_videos)}", "success")
+    last_known = max(candidate, max(store.pages_done, default=1))
+    pending = [n for n in range(2, last_known + 1) if n not in store.pages_done]
+    still_missing = []
 
-    log(f"Candidate last page: {candidate_last}")
-
-    target_max = max(candidate_last, max(pages_done, default=0))
-    remaining = [n for n in range(2, target_max + 1) if n not in pages_done]
-
-    if remaining:
-        log(f"Fetching {len(remaining)} pages in parallel ({args.workers} workers)...", "step")
-        results = fetch_range_parallel(
-            args.url, remaining, args.retries, args.workers, "Parallel fetch"
-        )
-        for n in sorted(results.keys()):
-            videos = results[n]
-            if videos is None:
-                log(f"Page {n} failed in parallel phase; queued for retry.", "warn")
-                continue
-            added = add_unique(videos, seen_urls, all_videos)
-            pages_done.add(n)
-            visited_page_urls.add(page_url(args.url, n))
-            save_checkpoint_safe(args.checkpoint, args.url, all_videos, pages_done)
-            log(f"Page {n}: +{added}, total {len(all_videos)}", "success")
-
-        failed = sorted([n for n, v in results.items() if v is None])
+    if pending:
+        log(f"Mengambil {len(pending)} halaman dengan {args.workers} worker...", "step")
+        results = fetch_parallel(args.url, pending, args.retries, args.workers)
+        failed = []
+        for n in sorted(results):
+            if results[n] is None:
+                failed.append(n)
+            else:
+                record_page(store, n, results[n])
         if failed:
-            log(f"Retrying {len(failed)} failed pages sequentially: {failed}", "warn")
-            for n in failed:
-                videos = fetch_page(page_url(args.url, n), args.retries, f"p{n}")
-                if videos is None:
-                    log(f"Page {n} still failed after retry; missing from output.", "error")
-                    continue
-                added = add_unique(videos, seen_urls, all_videos)
-                pages_done.add(n)
-                visited_page_urls.add(page_url(args.url, n))
-                save_checkpoint_safe(args.checkpoint, args.url, all_videos, pages_done)
-                log(f"Page {n} (retry): +{added}, total {len(all_videos)}", "success")
+            log(f"Mengulang {len(failed)} halaman yang gagal: {failed}", "warn")
+            still_missing = [n for n in failed if not fetch_and_record(store, args.url, n, args.retries)]
 
-    log("Verifying true end of pagination (probing beyond candidate)...", "step")
-    probe = max(candidate_last, max(pages_done, default=0)) + 1
-    extended = 0
-
+    log("Memverifikasi akhir pagination...", "step")
+    probe = last_known + 1
+    verified = True
     while probe <= SAFETY_PAGE_LIMIT:
-        url = page_url(args.url, probe)
-        if url in visited_page_urls:
-            log(f"Page {probe} URL already visited; stopping (cycle detected).", "warn")
-            break
-
-        videos = fetch_page(url, args.retries, f"p{probe}")
-        visited_page_urls.add(url)
-
+        videos = fetch_page(page_url(args.url, probe), args.retries)
         if videos is None:
-            log(f"Page {probe} failed; sleeping 3s then retrying once.", "warn")
-            time.sleep(3)
-            videos = fetch_page(url, args.retries, f"p{probe}")
-
-        if videos is None:
-            log(f"Page {probe} still failed; stopping verification.", "error")
+            log(f"Halaman {probe} gagal, verifikasi dihentikan.", "error")
+            verified = False
             break
-
         if not videos:
-            log(f"Page {probe} is empty; confirmed true end at page {probe - 1}.", "success")
+            log(f"Halaman {probe} kosong, akhir data ada di halaman {probe - 1}.", "success")
             break
-
-        added = add_unique(videos, seen_urls, all_videos)
-        pages_done.add(probe)
-        save_checkpoint_safe(args.checkpoint, args.url, all_videos, pages_done)
-        extended += 1
-        log(f"Page {probe} (extension): +{added}, total {len(all_videos)}", "success")
+        record_page(store, probe, videos)
         probe += 1
 
-    if extended:
-        log(f"Extended beyond candidate by {extended} page(s).")
+    complete = verified and not still_missing
+    if still_missing:
+        log(f"Halaman berikut tetap gagal dan tidak masuk output: {still_missing}", "error")
 
-    if _checkpoint_broken:
-        log(
-            "Note: checkpoint was broken during this run; "
-            "resume unavailable for next run.",
-            "warn",
-        )
-
-    records = shape_records(all_videos, args.fields)
-
+    records = shape_records(store.videos, args.fields)
     metadata = {
         "source_url": args.url,
         "total_videos": len(records),
         "scraped_at": datetime.now().isoformat(),
         "fields": fieldnames,
     }
-
-    log(f"Saving {len(records)} records to {out_path} ({args.format})...", "step")
-    save_output(str(out_path), args.format, records, fieldnames, metadata)
-
-    if not args.keep_checkpoint and Path(args.checkpoint).exists():
-        try:
-            Path(args.checkpoint).unlink()
-            log("Checkpoint removed.")
-        except Exception as exc:
-            log(f"Could not remove checkpoint: {exc}", "warn")
+    log(f"Menyimpan {len(records)} record ke {out_path}...", "step")
+    write_output(out_path, args.format, records, fieldnames, metadata)
 
     if not records:
-        log(
-            "WARNING: no videos were extracted. Check URL, network, or site structure.",
-            "warn",
-        )
+        log("PERINGATAN: tidak ada video yang diambil. Cek URL, jaringan, atau struktur situs.", "warn")
 
-    elapsed = time.time() - start
-    log(f"Done in {elapsed:.1f}s. {len(records)} records written.", "success")
-    return records, out_path, fieldnames, elapsed
+    if complete:
+        if not args.keep_checkpoint:
+            store.remove()
+    else:
+        log("Hasil belum lengkap. Checkpoint dipertahankan, jalankan ulang untuk melengkapi.", "warn")
+
+    return Result(records, out_path, fieldnames, time.monotonic() - start, complete)
 
 
-def print_summary(records, out_path, fieldnames, elapsed, args):
+def print_summary(result, args):
     print()
     print("=" * 60)
-    print(f"{Fore.CYAN}SUMMARY{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}RINGKASAN{Style.RESET_ALL}")
     print("=" * 60)
-    print(f"Source    : {Fore.BLUE}{args.url}{Style.RESET_ALL}")
-    print(f"Records   : {Fore.GREEN}{len(records)}{Style.RESET_ALL}")
-    print(f"Output    : {Fore.BLUE}{out_path}{Style.RESET_ALL}")
-    print(f"Format    : {Fore.BLUE}{args.format}{Style.RESET_ALL}")
-    print(f"Fields    : {Fore.BLUE}{', '.join(fieldnames)}{Style.RESET_ALL}")
-    print(f"Elapsed   : {Fore.BLUE}{elapsed:.1f}s{Style.RESET_ALL}")
+    print(f"Sumber    : {Fore.BLUE}{args.url}{Style.RESET_ALL}")
+    print(f"Record    : {Fore.GREEN}{len(result.records)}{Style.RESET_ALL}")
+    print(f"Output    : {Fore.BLUE}{result.out_path}{Style.RESET_ALL}")
+    print(f"Format    : {args.format}")
+    print(f"Fields    : {', '.join(result.fieldnames)}")
+    print(f"Waktu     : {result.elapsed:.1f}s")
+    print(f"Status    : {'lengkap' if result.complete else 'TIDAK LENGKAP'}")
     print("=" * 60)
-    for r in records[:5]:
-        if "title" in r and r["title"]:
+    for r in result.records[:5]:
+        if r.get("title"):
             print(f"{Fore.GREEN}- {r['title'][:60]}{Style.RESET_ALL}")
             print(f"  {Fore.BLUE}{r['url']}{Style.RESET_ALL}")
         else:
             print(f"{Fore.BLUE}{r['url']}{Style.RESET_ALL}")
-    if len(records) > 5:
-        print(f"{Fore.YELLOW}... and {len(records) - 5} more{Style.RESET_ALL}")
+    if len(result.records) > 5:
+        print(f"{Fore.YELLOW}... dan {len(result.records) - 5} lainnya{Style.RESET_ALL}")
+
+
+def positive_int(low, high):
+    def parse(text):
+        value = int(text)
+        if not low <= value <= high:
+            raise argparse.ArgumentTypeError(f"harus di antara {low} dan {high}")
+        return value
+    return parse
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Scraper video profil Eporner")
+    parser.add_argument("-u", "--url", required=True, help="URL profil Eporner")
+    parser.add_argument("-o", "--output", default="output", help="Path file output")
+    parser.add_argument("-f", "--format", choices=["csv", "json"], default="csv")
+    parser.add_argument("-F", "--fields", choices=["all", "url"], default="all", help="all = title+url, url = hanya url")
+    parser.add_argument("-w", "--workers", type=positive_int(1, 10), default=3)
+    parser.add_argument("-r", "--retries", type=positive_int(1, 10), default=3)
+    parser.add_argument("-c", "--checkpoint", default=DEFAULT_CHECKPOINT)
+    parser.add_argument("-n", "--no-resume", action="store_true", help="abaikan checkpoint lama")
+    parser.add_argument("-k", "--keep-checkpoint", action="store_true", help="simpan checkpoint setelah sukses")
+    parser.add_argument("-v", "--verbose", action="store_true", help="tampilkan waktu tiap halaman")
+    args = parser.parse_args()
+
+    normalized = normalize_profile_url(args.url)
+    if normalized is None:
+        parser.error("-u/--url harus berupa URL eporner.com/profile/<username>")
+    args.url = normalized
+    return args
 
 
 def main():
+    global _verbose
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     args = parse_args()
+    _verbose = args.verbose
+
     try:
-        records, out_path, fieldnames, elapsed = run(args)
+        result = run(args)
     except KeyboardInterrupt:
-        log("Interrupted by user.", "warn")
+        log("Dihentikan oleh pengguna. Jalankan ulang untuk melanjutkan.", "warn")
         return 130
     except ValueError as exc:
-        log(f"Validation error: {exc}", "error")
+        log(f"Error validasi: {exc}", "error")
         return 2
     except Exception as exc:
-        log(f"Fatal error: {type(exc).__name__}: {exc}", "error")
+        log(f"Error fatal: {type(exc).__name__}: {exc}", "error")
         return 1
     finally:
         close_all_drivers()
 
-    try:
-        print_summary(records, out_path, fieldnames, elapsed, args)
-    except Exception as exc:
-        log(f"Summary display failed ({exc}); output already saved.", "warn")
-
-    return 0
+    print_summary(result, args)
+    return 0 if result.complete else 1
 
 
 if __name__ == "__main__":
