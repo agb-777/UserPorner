@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import csv
 import json
@@ -23,6 +25,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 DEFAULT_CHECKPOINT = ".scraper_checkpoint.json"
 FORMATS = ("csv", "json", "md", "pdf")
 FIELD_CHOICES = ("all", "url")
+FIELD_LABELS = {"title": "Title", "url": "URL"}
 PROFILE_PATTERN = re.compile(r"https?://(?:www\.)?eporner\.com/profile/([^/?#]+)", re.IGNORECASE)
 PAGE_PATTERN = re.compile(r"/uploaded-videos/(\d+)(?:[/?#]|$)")
 VIDEO_MARKER = "/video-"
@@ -53,21 +56,21 @@ CHROME_ARGUMENTS = (
 )
 
 _LOG_LOCK = threading.Lock()
-_LOG_COLORS = {
-    "info": Fore.CYAN,
-    "success": Fore.GREEN,
-    "warn": Fore.YELLOW,
-    "error": Fore.RED,
-    "step": Fore.MAGENTA,
-    "dim": Fore.WHITE,
+_LOG_STYLES = {
+    "info": (Fore.CYAN, "*"),
+    "success": (Fore.GREEN, "+"),
+    "warn": (Fore.YELLOW, "!"),
+    "error": (Fore.RED, "x"),
+    "step": (Fore.MAGENTA, ">"),
+    "dim": (Fore.WHITE, "-"),
 }
 
 
 def log(message, level="info"):
+    color, symbol = _LOG_STYLES.get(level, (Fore.WHITE, "-"))
     stamp = datetime.now().strftime("%H:%M:%S")
-    color = _LOG_COLORS.get(level, Fore.WHITE)
     with _LOG_LOCK:
-        print(f"{color}[{stamp}] {message}{Style.RESET_ALL}", flush=True)
+        print(f"{color}{Style.DIM}[{stamp}]{Style.NORMAL} {symbol} {message}{Style.RESET_ALL}", flush=True)
 
 
 def _build_options():
@@ -90,6 +93,10 @@ class DriverPool:
         self._drivers = []
         self._lock = threading.Lock()
         self._closed = False
+
+    @property
+    def closed(self):
+        return self._closed
 
     def acquire(self):
         if self._closed:
@@ -197,6 +204,8 @@ def load_listing(driver, url):
 def fetch_page(pool, url, retries):
     reason = "unknown"
     for attempt in range(1, retries + 1):
+        if pool.closed:
+            return None
         try:
             videos = load_listing(pool.acquire(), url)
             reason = "page did not render"
@@ -206,7 +215,7 @@ def fetch_page(pool, url, retries):
             reason = type(exc).__name__
         if videos is not None:
             return videos
-        if attempt < retries:
+        if attempt < retries and not pool.closed:
             log(f"Attempt {attempt}/{retries} failed ({reason}): {url}", "warn")
             time.sleep(RETRY_DELAY)
     log(f"All {retries} attempts failed: {url}", "error")
@@ -312,7 +321,7 @@ class Checkpoint:
             if _is_page_key(key) and isinstance(videos, list):
                 self.pages[int(key)] = [video for video in videos if _is_video(video)]
         if self.pages:
-            log(f"Resuming from checkpoint: {len(self.pages)} pages, {len(self.videos)} videos")
+            log(f"Resuming from checkpoint: {len(self.pages)} pages, {len(self.videos)} videos", "success")
 
     def record(self, number, videos):
         self.pages[number] = videos
@@ -340,7 +349,7 @@ def _clean(value):
 
 
 def _write_csv(path, records, fieldnames, metadata):
-    with path.open("w", newline="", encoding="utf-8") as handle:
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(records)
@@ -352,75 +361,119 @@ def _write_json(path, records, fieldnames, metadata):
 
 
 def _write_md(path, records, fieldnames, metadata):
-    headers = ["No", *(name.capitalize() for name in fieldnames)]
+    headers = ["No", *(FIELD_LABELS[name] for name in fieldnames)]
+    alignment = [":--:", *([":--"] * len(fieldnames))]
     lines = [
-        f"# Eporner videos",
+        "# Eporner Video Listing",
         "",
-        f"- Source: {metadata['source_url']}",
-        f"- Total videos: {metadata['total_videos']}",
-        f"- Scraped at: {metadata['scraped_at']}",
+        f"> **Source:** {metadata['source_url']}  ",
+        f"> **Total videos:** {metadata['total_videos']}  ",
+        f"> **Scraped at:** {metadata['scraped_at']}",
         "",
         "| " + " | ".join(headers) + " |",
-        "|" + "|".join("---" for _ in headers) + "|",
+        "| " + " | ".join(alignment) + " |",
     ]
     for index, record in enumerate(records, start=1):
-        cells = [str(index), *(_clean(record[name]).replace("|", "\\|") for name in fieldnames)]
+        cells = [str(index)]
+        for name in fieldnames:
+            value = _clean(record[name]).replace("|", "\\|")
+            cells.append(f"<{value}>" if name == "url" else value)
         lines.append("| " + " | ".join(cells) + " |")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _write_pdf(path, records, fieldnames, metadata):
     from reportlab.lib import colors
+    from reportlab.lib.enums import TA_RIGHT
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-    margin = 30
+    navy = colors.HexColor("#1F2A44")
+    accent = colors.HexColor("#2F6DB5")
+    stripe = colors.HexColor("#F2F5FA")
+    rule = colors.HexColor("#C9D3E3")
+    muted = colors.HexColor("#5B6577")
+
     page_size = landscape(A4)
+    margin = 28
     usable = page_size[0] - 2 * margin
     number_width = 40
+    text_width = usable - number_width
     shares = [0.45, 0.55] if len(fieldnames) == 2 else [1.0]
-    widths = [number_width] + [(usable - number_width) * share for share in shares]
+    widths = [number_width, *(text_width * share for share in shares)]
 
     base = getSampleStyleSheet()["BodyText"]
-    cell = ParagraphStyle("cell", parent=base, fontSize=7, leading=9)
-    head = ParagraphStyle("head", parent=cell, fontName="Helvetica-Bold")
+    title_style = ParagraphStyle(
+        "title", parent=base, fontName="Helvetica-Bold", fontSize=18, leading=22, textColor=navy, spaceAfter=4
+    )
+    meta_style = ParagraphStyle("meta", parent=base, fontSize=8.5, leading=12, textColor=muted)
+    head_style = ParagraphStyle(
+        "head", parent=base, fontName="Helvetica-Bold", fontSize=8, leading=10, textColor=colors.white
+    )
+    cell_style = ParagraphStyle("cell", parent=base, fontSize=7.5, leading=9.5, textColor=colors.black)
+    link_style = ParagraphStyle("link", parent=cell_style, textColor=accent)
+    index_style = ParagraphStyle("index", parent=cell_style, textColor=muted, alignment=TA_RIGHT)
 
-    headers = ["No", *(name.capitalize() for name in fieldnames)]
-    rows = [[Paragraph(escape(header), head) for header in headers]]
+    headers = ["No", *(FIELD_LABELS[name] for name in fieldnames)]
+    rows = [[Paragraph(escape(header), head_style) for header in headers]]
     for index, record in enumerate(records, start=1):
-        row = [Paragraph(str(index), cell)]
-        row.extend(Paragraph(escape(_clean(record[name])), cell) for name in fieldnames)
+        row = [Paragraph(str(index), index_style)]
+        for name in fieldnames:
+            style = link_style if name == "url" else cell_style
+            row.append(Paragraph(escape(_clean(record[name])), style))
         rows.append(row)
 
     table = Table(rows, colWidths=widths, repeatRows=1)
     table.setStyle(
         TableStyle(
             [
-                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#DDDDDD")),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 3),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                ("BACKGROUND", (0, 0), (-1, 0), navy),
+                ("LINEBELOW", (0, 0), (-1, 0), 1.2, accent),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, stripe]),
+                ("GRID", (0, 0), (-1, -1), 0.25, rule),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
             ]
         )
     )
 
-    title = Paragraph(escape(f"Eporner videos: {metadata['source_url']}"), getSampleStyleSheet()["Heading2"])
-    summary = Paragraph(
-        escape(f"Total videos: {metadata['total_videos']} | Scraped at: {metadata['scraped_at']}"),
-        base,
-    )
+    story = [
+        Paragraph("Eporner Video Listing", title_style),
+        Paragraph(
+            escape(
+                f"Source: {metadata['source_url']}  |  Total videos: {metadata['total_videos']}  |  "
+                f"Scraped at: {metadata['scraped_at']}"
+            ),
+            meta_style,
+        ),
+        Spacer(1, 12),
+        table,
+    ]
+
+    def draw_footer(canvas, doc):
+        canvas.saveState()
+        canvas.setStrokeColor(rule)
+        canvas.line(margin, 24, page_size[0] - margin, 24)
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(muted)
+        canvas.drawString(margin, 14, "Generated by Eporner scraper")
+        canvas.drawRightString(page_size[0] - margin, 14, f"Page {doc.page}")
+        canvas.restoreState()
+
     document = SimpleDocTemplate(
         str(path),
         pagesize=page_size,
         leftMargin=margin,
         rightMargin=margin,
         topMargin=margin,
-        bottomMargin=margin,
-        title="Eporner videos",
+        bottomMargin=margin + 8,
+        title="Eporner Video Listing",
     )
-    document.build([title, summary, Spacer(1, 10), table])
+    document.build(story, onFirstPage=draw_footer, onLaterPages=draw_footer)
 
 
 WRITERS = {"csv": _write_csv, "json": _write_json, "md": _write_md, "pdf": _write_pdf}
@@ -519,7 +572,11 @@ def _fetch_pages(pool, job, checkpoint, pages):
 
         for future in as_completed(futures):
             page = futures[future]
-            videos = future.result()
+            try:
+                videos = future.result()
+            except Exception as exc:
+                log(f"Page {page} raised {type(exc).__name__}: {exc}", "error")
+                videos = None
             if videos is None:
                 failed.append(page)
             else:
@@ -564,7 +621,7 @@ def run(job, pool):
 
     log("Detecting last page...", "step")
     candidate = detect_last_page(pool, page_url(job.url, 1), job.retries)
-    log(f"Estimated last page: {candidate}")
+    log(f"Estimated last page: {candidate}", "info")
 
     if 1 not in checkpoint.pages and not _fetch_and_record(pool, job, checkpoint, 1):
         raise RuntimeError("page 1 failed after all retries, checkpoint kept")
@@ -581,9 +638,10 @@ def run(job, pool):
 
     fieldnames = fieldnames_for(job.fields)
     records = _shape(checkpoint.videos, job.fields)
+    saved = False
 
     if job.output is None:
-        log("No output path given (-o), results are not saved.", "warn")
+        log("No output path given (-o), results were not saved.", "warn")
     else:
         metadata = {
             "source_url": job.url,
@@ -594,17 +652,20 @@ def run(job, pool):
         log(f"Saving {len(records)} records to {job.output} ({job.fmt})...", "step")
         save_records(job.output, job.fmt, records, fieldnames, metadata)
         log(f"Saved to {job.output}", "success")
+        saved = True
 
     if not records:
-        log("WARNING: no videos were extracted. Check the URL, network, or site structure.", "warn")
+        log("No videos were extracted. Check the URL, network, or site structure.", "warn")
     if not complete:
         log("Results are incomplete. Checkpoint kept, run again to continue.", "warn")
-    elif not job.keep_checkpoint:
+    elif saved and not job.keep_checkpoint:
         checkpoint.discard()
+    elif not saved:
+        log("Checkpoint kept so you can save later with -o.", "info")
 
     return Outcome(
         records=records,
-        output=job.output,
+        output=job.output if saved else None,
         fmt=job.fmt,
         fieldnames=fieldnames,
         elapsed=time.monotonic() - started,
@@ -625,8 +686,8 @@ def _bounded(low, high):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Scrape video listings from an Eporner profile.")
     parser.add_argument("-i", "--interactive", action="store_true", help="run in interactive mode")
-    parser.add_argument("-u", "--url", help="Eporner profile URL")
-    parser.add_argument("-o", "--output", help="output file path (nothing is saved if omitted)")
+    parser.add_argument("-u", "--url", help="Eporner profile URL (CLI mode only)")
+    parser.add_argument("-o", "--output", help="output file path (CLI mode only, nothing is saved if omitted)")
     parser.add_argument("-f", "--format", choices=FORMATS, default="csv", help="output format")
     parser.add_argument(
         "-F", "--fields", choices=FIELD_CHOICES, default="all", help="all = title and url, url = url only"
@@ -639,17 +700,19 @@ def parse_args(argv=None):
     parser.add_argument("-v", "--verbose", action="store_true", help="show time per page")
     args = parser.parse_args(argv)
 
-    if not args.interactive:
-        if not args.url:
-            parser.error("-u/--url is required unless -i is used")
-        if normalize_profile_url(args.url) is None:
-            parser.error("-u/--url must be an eporner.com/profile/<username> URL")
+    if args.interactive:
+        if args.url or args.output:
+            parser.error("-i cannot be combined with -u or -o, interactive mode asks for them")
+        return args
+
+    if not args.url:
+        parser.error("-u/--url is required unless -i is used")
+    if normalize_profile_url(args.url) is None:
+        parser.error("-u/--url must be an eporner.com/profile/<username> URL")
     return args
 
 
-def make_job(
-    url, fmt, fields, output, workers, retries, checkpoint, keep_checkpoint, fresh, verbose
-):
+def make_job(url, fmt, fields, output, workers, retries, checkpoint, keep_checkpoint, fresh, verbose):
     return Job(
         url=url,
         output=resolve_output(output, fmt) if output else None,
@@ -680,8 +743,8 @@ def job_from_args(args):
 
 
 def _ask(prompt, default=""):
-    suffix = f" [{default}]" if default else ""
-    return input(f"{prompt}{suffix}: ").strip() or default
+    suffix = f" {Fore.WHITE}[{default}]{Style.RESET_ALL}" if default else ""
+    return input(f"{Fore.CYAN}?{Style.RESET_ALL} {prompt}{suffix}: ").strip() or default
 
 
 def _ask_choice(prompt, choices, default):
@@ -690,7 +753,7 @@ def _ask_choice(prompt, choices, default):
         answer = _ask(f"{prompt} ({options})", default).lower()
         if answer in choices:
             return answer
-        print(f"Please choose one of: {options}")
+        print(f"{Fore.YELLOW}Please choose one of: {options}{Style.RESET_ALL}")
 
 
 def _ask_int(prompt, default, low, high):
@@ -699,11 +762,11 @@ def _ask_int(prompt, default, low, high):
         try:
             value = int(answer)
         except ValueError:
-            print("Please enter a number.")
+            print(f"{Fore.YELLOW}Please enter a number.{Style.RESET_ALL}")
             continue
         if low <= value <= high:
             return value
-        print(f"Please enter a number between {low} and {high}.")
+        print(f"{Fore.YELLOW}Please enter a number between {low} and {high}.{Style.RESET_ALL}")
 
 
 def _ask_url():
@@ -711,11 +774,11 @@ def _ask_url():
         url = normalize_profile_url(_ask("Profile URL (eporner.com/profile/<username>)"))
         if url is not None:
             return url
-        print("That is not a valid Eporner profile URL.")
+        print(f"{Fore.YELLOW}That is not a valid Eporner profile URL.{Style.RESET_ALL}")
 
 
 def interactive_job():
-    print(f"{Fore.CYAN}Eporner scraper, interactive mode{Style.RESET_ALL}")
+    print_banner("Interactive mode")
     url = _ask_url()
     fmt = _ask_choice("Format", FORMATS, "csv")
     fields = _ask_choice("Fields", FIELD_CHOICES, "all")
@@ -736,27 +799,40 @@ def interactive_job():
     )
 
 
+def print_banner(subtitle=""):
+    width = 60
+    line = f"{Fore.BLUE}{'=' * width}{Style.RESET_ALL}"
+    print(line)
+    print(f"{Fore.CYAN}{Style.BRIGHT}{'EPORNER SCRAPER':^{width}}{Style.RESET_ALL}")
+    if subtitle:
+        print(f"{Fore.WHITE}{subtitle:^{width}}{Style.RESET_ALL}")
+    print(line)
+
+
 def print_summary(outcome, job):
-    rule = "=" * 60
-    status = "complete" if outcome.complete else "INCOMPLETE"
-    saved = str(outcome.output) if outcome.output else "not saved (use -o to save)"
+    width = 60
+    rule = f"{Fore.BLUE}{'-' * width}{Style.RESET_ALL}"
+    status = (
+        f"{Fore.GREEN}{Style.BRIGHT}COMPLETE{Style.RESET_ALL}"
+        if outcome.complete
+        else f"{Fore.RED}{Style.BRIGHT}INCOMPLETE{Style.RESET_ALL}"
+    )
+    saved = str(outcome.output) if outcome.output else f"{Fore.YELLOW}not saved (use -o){Style.RESET_ALL}"
     print()
-    print(rule)
-    print(f"{Fore.CYAN}SUMMARY{Style.RESET_ALL}")
-    print(rule)
-    print(f"Source  : {job.url}")
-    print(f"Records : {len(outcome.records)}")
-    print(f"Output  : {saved}")
-    print(f"Format  : {outcome.fmt}")
-    print(f"Fields  : {', '.join(outcome.fieldnames)}")
-    print(f"Elapsed : {outcome.elapsed:.1f}s")
-    print(f"Status  : {status}")
+    print_banner("Summary")
+    print(f"{Fore.CYAN}Source  {Style.RESET_ALL}: {job.url}")
+    print(f"{Fore.CYAN}Records {Style.RESET_ALL}: {Fore.GREEN}{Style.BRIGHT}{len(outcome.records)}{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}Output  {Style.RESET_ALL}: {saved}")
+    print(f"{Fore.CYAN}Format  {Style.RESET_ALL}: {outcome.fmt}")
+    print(f"{Fore.CYAN}Fields  {Style.RESET_ALL}: {', '.join(outcome.fieldnames)}")
+    print(f"{Fore.CYAN}Elapsed {Style.RESET_ALL}: {outcome.elapsed:.1f}s")
+    print(f"{Fore.CYAN}Status  {Style.RESET_ALL}: {status}")
     print(rule)
     for record in outcome.records[:5]:
         label = record.get("title") or record["url"]
-        print(f"{Fore.GREEN}- {label[:60]}{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}  - {label[:60]}{Style.RESET_ALL}")
     if len(outcome.records) > 5:
-        print(f"... and {len(outcome.records) - 5} more")
+        print(f"{Fore.WHITE}  ... and {len(outcome.records) - 5} more{Style.RESET_ALL}")
 
 
 def main(argv=None):
@@ -774,6 +850,9 @@ def main(argv=None):
     except KeyboardInterrupt:
         log("Stopped by user. Run again to resume.", "warn")
         return 130
+    except EOFError:
+        log("Input ended before setup was complete.", "error")
+        return 2
     except ValueError as exc:
         log(f"Validation error: {exc}", "error")
         return 2
