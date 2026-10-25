@@ -6,7 +6,7 @@
 
 ## About
 
-A command-line scraper for Eporner profile pages. Given a username, it walks through every page of that user's uploaded videos and collects the title and URL of each video.
+A command-line scraper for [Eporner](https://www.eporner.com/) profile pages. Given a username, it walks through every page of that user's uploaded videos and collects the title and URL of each video.
 
 The result is written to a CSV or JSON file. You can save both fields, or only the URLs.
 
