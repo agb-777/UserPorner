@@ -4,12 +4,16 @@
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-purple.svg)
 
-![](https://github.com/agb-777/userporner/blob/main/sikrinsot.png)
-
 Scrape the video list of an Eporner profile into CSV, JSON, Markdown, or PDF.
 
-- **Author:** agb-777
-- **Homepage:** https://github.com/agb-777/userporner
+## Table of Contents
+
+- [Install](#install)
+- [Usage](#usage)
+- [Options](#options)
+- [Examples](#examples)
+- [Screenshots](#screenshots)
+- [License](#license)
 
 ## Install
 
@@ -67,6 +71,16 @@ Title and URL as PDF, with 5 workers:
 python userporner.py -u https://www.eporner.com/profile/USERNAME/ -o videos -f pdf -w 5
 ```
 
+## Screenshots
+
+![Screenshot of the CLI run](https://github.com/agb-777/userporner/blob/main/img/sikrinsot1.png)
+
+*Figure 1. Running the scraper from the command line.*
+
+![Screenshot of the output](https://github.com/agb-777/userporner/blob/main/img/sikrinsot2.png)
+
+*Figure 2. Result summary after a completed run.*
+
 ## License
 
-MIT
+[MIT](https://github.com/agb-777/userporner/blob/main/LICENSE)
