@@ -698,23 +698,63 @@ def _bounded(low, high):
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="Scrape video listings from an Eporner profile.")
-    parser.add_argument("-i", "--interactive", action="store_true", help="run in interactive mode")
-    parser.add_argument("-u", "--url", help="Eporner profile URL (CLI mode only)")
-    parser.add_argument("-o", "--output", help="output file path (CLI mode only, nothing is saved if omitted)")
-    parser.add_argument("-f", "--format", choices=FORMATS, help="output format (CLI mode only, default csv)")
-    parser.add_argument(
-        "-F", "--fields", choices=FIELD_CHOICES, help="all = title and url, url = url only (CLI mode only)"
+    parser = argparse.ArgumentParser(
+        prog="userporner.py",
+        description="Scrape video listings from an Eporner profile.",
+        epilog=(
+            "examples:\n"
+            "  python userporner.py -u https://www.eporner.com/profile/NAME/ -o hasil -f md\n"
+            "  python userporner.py -u https://www.eporner.com/profile/NAME/ -o hasil -f pdf -F url -k\n"
+            "  python userporner.py -u https://www.eporner.com/profile/NAME/\n"
+            "  python userporner.py -i"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
     )
-    parser.add_argument("-w", "--workers", type=_bounded(1, MAX_WORKERS), help="parallel workers (CLI mode only, default 3)")
-    parser.add_argument("-r", "--retries", type=_bounded(1, MAX_RETRIES), help="retries per page (CLI mode only, default 3)")
-    parser.add_argument("-c", "--checkpoint", help=f"checkpoint file path (CLI mode only, default {DEFAULT_CHECKPOINT})")
-    parser.add_argument("-n", "--no-resume", action="store_true", help="ignore existing checkpoint (CLI mode only)")
-    parser.add_argument("-k", "--keep-checkpoint", action="store_true", help="keep checkpoint after success (CLI mode only)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="show time per page (CLI mode only)")
+    parser.add_argument(
+        "-i", "--interactive", action="store_true",
+        help="run in interactive mode, all settings are asked step by step",
+    )
+
+    cli = parser.add_argument_group("CLI options (cannot be combined with -i)")
+    cli.add_argument("-u", "--url", help="Eporner profile URL")
+    cli.add_argument("-o", "--output", help="output file path, nothing is saved if omitted")
+    cli.add_argument(
+        "-f", "--format", choices=FORMATS,
+        help=f"output format: {', '.join(FORMATS)} (default: {DEFAULT_FORMAT})",
+    )
+    cli.add_argument(
+        "-F", "--fields", choices=FIELD_CHOICES,
+        help=f"all = title and url, url = url only (default: {DEFAULT_FIELDS})",
+    )
+    cli.add_argument(
+        "-w", "--workers", type=_bounded(1, MAX_WORKERS),
+        help=f"parallel workers, 1-{MAX_WORKERS} (default: {DEFAULT_WORKERS})",
+    )
+    cli.add_argument(
+        "-r", "--retries", type=_bounded(1, MAX_RETRIES),
+        help=f"retries per page, 1-{MAX_RETRIES} (default: {DEFAULT_RETRIES})",
+    )
+    cli.add_argument(
+        "-c", "--checkpoint",
+        help=f"checkpoint file path (default: {DEFAULT_CHECKPOINT})",
+    )
+    cli.add_argument(
+        "-n", "--no-resume", action="store_true",
+        help="ignore and delete any existing checkpoint, start from scratch",
+    )
+    cli.add_argument(
+        "-k", "--keep-checkpoint", action="store_true",
+        help="keep the checkpoint file after a complete run",
+    )
+    cli.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="show the time taken for each page",
+    )
+
     args = parser.parse_args(argv)
 
-    cli_only = {
+    cli_values = {
         "-u": args.url,
         "-o": args.output,
         "-f": args.format,
@@ -728,7 +768,7 @@ def parse_args(argv=None):
     }
 
     if args.interactive:
-        used = [flag for flag, value in cli_only.items() if value not in (None, False)]
+        used = [flag for flag, value in cli_values.items() if value not in (None, False)]
         if used:
             parser.error(f"-i cannot be combined with {', '.join(used)}, interactive mode asks for them")
         return args
