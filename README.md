@@ -4,6 +4,8 @@
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-purple.svg)
 
+<img src="https://github.com/agb-777/UserPorner/blob/main/img/icon.png" width="600" />
+
 Scrape the video list of an Eporner profile into CSV, JSON, Markdown, or PDF.
 
 ## Table of Contents
