@@ -4,6 +4,8 @@
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-purple.svg)
 
+![](https://github.com/agb-777/userporner/blob/main/sikrinsot.png)
+
 ## About
 
 A command-line scraper for [Eporner](https://www.eporner.com/) profile pages. Given a username, it walks through every page of that user's uploaded videos and collects the title and URL of each video.
