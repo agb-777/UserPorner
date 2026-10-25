@@ -23,6 +23,10 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 DEFAULT_CHECKPOINT = ".scraper_checkpoint.json"
+DEFAULT_FORMAT = "csv"
+DEFAULT_FIELDS = "all"
+DEFAULT_WORKERS = 3
+DEFAULT_RETRIES = 3
 FORMATS = ("csv", "json", "md", "pdf")
 FIELD_CHOICES = ("all", "url")
 FIELD_LABELS = {"title": "Title", "url": "URL"}
@@ -481,8 +485,12 @@ WRITERS = {"csv": _write_csv, "json": _write_json, "md": _write_md, "pdf": _writ
 
 def save_records(path, fmt, records, fieldnames, metadata):
     tmp = path.with_name(path.name + ".tmp")
-    WRITERS[fmt](tmp, records, fieldnames, metadata)
-    tmp.replace(path)
+    try:
+        WRITERS[fmt](tmp, records, fieldnames, metadata)
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def resolve_output(raw, fmt):
@@ -594,6 +602,7 @@ def _fetch_pages(pool, job, checkpoint, pages):
 
 
 def _verify_end(pool, job, checkpoint, page):
+    previous = None
     while page <= SAFETY_PAGE_LIMIT:
         url = page_url(job.url, page)
         videos = fetch_page(pool, url, job.retries)
@@ -605,6 +614,11 @@ def _verify_end(pool, job, checkpoint, page):
         if not videos:
             log(f"Page {page} is empty, last page is {page - 1}.", "success")
             return True
+        urls = {video["url"] for video in videos}
+        if urls == previous:
+            log(f"Page {page} repeats the previous page, last page is {page - 1}.", "success")
+            return True
+        previous = urls
         _record(checkpoint, page, videos)
         page += 1
     log("Reached the safety page limit.", "warn")
@@ -641,7 +655,7 @@ def run(job, pool):
     saved = False
 
     if job.output is None:
-        log("No output path given (-o), results were not saved.", "warn")
+        log("No output path given, results were not saved.", "warn")
     else:
         metadata = {
             "source_url": job.url,
@@ -661,7 +675,7 @@ def run(job, pool):
     elif saved and not job.keep_checkpoint:
         checkpoint.discard()
     elif not saved:
-        log("Checkpoint kept so you can save later with -o.", "info")
+        log("Checkpoint kept so you can save later.", "info")
 
     return Outcome(
         records=records,
@@ -688,27 +702,47 @@ def parse_args(argv=None):
     parser.add_argument("-i", "--interactive", action="store_true", help="run in interactive mode")
     parser.add_argument("-u", "--url", help="Eporner profile URL (CLI mode only)")
     parser.add_argument("-o", "--output", help="output file path (CLI mode only, nothing is saved if omitted)")
-    parser.add_argument("-f", "--format", choices=FORMATS, default="csv", help="output format")
+    parser.add_argument("-f", "--format", choices=FORMATS, help="output format (CLI mode only, default csv)")
     parser.add_argument(
-        "-F", "--fields", choices=FIELD_CHOICES, default="all", help="all = title and url, url = url only"
+        "-F", "--fields", choices=FIELD_CHOICES, help="all = title and url, url = url only (CLI mode only)"
     )
-    parser.add_argument("-w", "--workers", type=_bounded(1, MAX_WORKERS), default=3, help="parallel workers")
-    parser.add_argument("-r", "--retries", type=_bounded(1, MAX_RETRIES), default=3, help="retries per page")
-    parser.add_argument("-c", "--checkpoint", default=DEFAULT_CHECKPOINT, help="checkpoint file path")
-    parser.add_argument("-n", "--no-resume", action="store_true", help="ignore existing checkpoint")
-    parser.add_argument("-k", "--keep-checkpoint", action="store_true", help="keep checkpoint after success")
-    parser.add_argument("-v", "--verbose", action="store_true", help="show time per page")
+    parser.add_argument("-w", "--workers", type=_bounded(1, MAX_WORKERS), help="parallel workers (CLI mode only, default 3)")
+    parser.add_argument("-r", "--retries", type=_bounded(1, MAX_RETRIES), help="retries per page (CLI mode only, default 3)")
+    parser.add_argument("-c", "--checkpoint", help=f"checkpoint file path (CLI mode only, default {DEFAULT_CHECKPOINT})")
+    parser.add_argument("-n", "--no-resume", action="store_true", help="ignore existing checkpoint (CLI mode only)")
+    parser.add_argument("-k", "--keep-checkpoint", action="store_true", help="keep checkpoint after success (CLI mode only)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="show time per page (CLI mode only)")
     args = parser.parse_args(argv)
 
+    cli_only = {
+        "-u": args.url,
+        "-o": args.output,
+        "-f": args.format,
+        "-F": args.fields,
+        "-w": args.workers,
+        "-r": args.retries,
+        "-c": args.checkpoint,
+        "-n": args.no_resume,
+        "-k": args.keep_checkpoint,
+        "-v": args.verbose,
+    }
+
     if args.interactive:
-        if args.url or args.output:
-            parser.error("-i cannot be combined with -u or -o, interactive mode asks for them")
+        used = [flag for flag, value in cli_only.items() if value not in (None, False)]
+        if used:
+            parser.error(f"-i cannot be combined with {', '.join(used)}, interactive mode asks for them")
         return args
 
     if not args.url:
         parser.error("-u/--url is required unless -i is used")
     if normalize_profile_url(args.url) is None:
         parser.error("-u/--url must be an eporner.com/profile/<username> URL")
+
+    args.format = args.format or DEFAULT_FORMAT
+    args.fields = args.fields or DEFAULT_FIELDS
+    args.workers = args.workers or DEFAULT_WORKERS
+    args.retries = args.retries or DEFAULT_RETRIES
+    args.checkpoint = args.checkpoint or DEFAULT_CHECKPOINT
     return args
 
 
@@ -780,11 +814,13 @@ def _ask_url():
 def interactive_job():
     print_banner("Interactive mode")
     url = _ask_url()
-    fmt = _ask_choice("Format", FORMATS, "csv")
-    fields = _ask_choice("Fields", FIELD_CHOICES, "all")
     output = _ask("Output file (empty = do not save)")
-    workers = _ask_int("Workers", 3, 1, MAX_WORKERS)
-    retries = _ask_int("Retries", 3, 1, MAX_RETRIES)
+    fmt, fields = DEFAULT_FORMAT, DEFAULT_FIELDS
+    if output:
+        fmt = _ask_choice("Format", FORMATS, DEFAULT_FORMAT)
+        fields = _ask_choice("Fields", FIELD_CHOICES, DEFAULT_FIELDS)
+    workers = _ask_int("Workers", DEFAULT_WORKERS, 1, MAX_WORKERS)
+    retries = _ask_int("Retries", DEFAULT_RETRIES, 1, MAX_RETRIES)
     return make_job(
         url=url,
         fmt=fmt,
@@ -848,9 +884,11 @@ def main(argv=None):
             ensure_output_ready(job.output, job.fmt)
         outcome = run(job, pool)
     except KeyboardInterrupt:
+        print(flush=True)
         log("Stopped by user. Run again to resume.", "warn")
         return 130
     except EOFError:
+        print(flush=True)
         log("Input ended before setup was complete.", "error")
         return 2
     except ValueError as exc:
