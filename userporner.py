@@ -60,6 +60,7 @@ CHROME_ARGUMENTS = (
 )
 
 _LOG_LOCK = threading.Lock()
+_DRIVER_START_LOCK = threading.Lock()
 _LOG_STYLES = {
     "info": (Fore.CYAN, "*"),
     "success": (Fore.GREEN, "+"),
@@ -128,7 +129,8 @@ class DriverPool:
             _quit_quietly(driver)
 
     def _create(self):
-        driver = webdriver.Chrome(options=_build_options())
+        with _DRIVER_START_LOCK:
+            driver = webdriver.Chrome(options=_build_options())
         driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
         with self._lock:
             self._drivers.append(driver)
