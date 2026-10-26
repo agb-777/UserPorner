@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from xml.sax.saxutils import escape
 
 from colorama import Fore, Style, init
@@ -48,6 +48,8 @@ PAGE_PATTERN = re.compile(r"/uploaded-videos/(\d+)(?:[/?#]|$)")
 VIDEO_MARKER = "/video-"
 # Text that appears in the markup of every real listing page, even when it has no videos.
 LISTING_MARKER = "/uploaded-videos/"
+# Only links on these hosts are counted as videos.
+SITE_HOST = "eporner.com"
 
 # Network settings, in seconds unless noted.
 REQUEST_TIMEOUT = 20
@@ -64,6 +66,7 @@ USER_AGENT = (
 HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "text/html",
+    "Accept-Encoding": "identity",  # urllib does not decompress gzip, so ask for plain HTML.
     "Accept-Language": "en-US,en;q=0.9",
 }
 
@@ -112,6 +115,12 @@ def page_number(url):
     # Read the page number from a URL. Default to 1 when there is none.
     match = PAGE_PATTERN.search(url or "")
     return int(match.group(1)) if match else 1
+
+
+def _on_site(url):
+    # True if the URL points to eporner.com or one of its subdomains.
+    host = (urlsplit(url).hostname or "").lower()
+    return host == SITE_HOST or host.endswith("." + SITE_HOST)
 
 
 def _is_listing(final_url, number):
@@ -165,7 +174,11 @@ class _VideoParser(HTMLParser):
         if VIDEO_MARKER not in href:
             return
         # Relative links are resolved against the page URL, like a browser does.
-        self._href = urljoin(self._base, href)
+        absolute = urljoin(self._base, href)
+        # Ignore video-looking links that point to other sites, such as ads.
+        if not _on_site(absolute):
+            return
+        self._href = absolute
         self._in_container = any(self._div_stack)
         self._title = (attr.get("title") or "").strip()
         self._alt = ""
@@ -257,18 +270,22 @@ def fetch_page(base, number, attempts):
             # Covers timeouts, connection resets, and incomplete reads.
             reason = type(exc).__name__
         else:
-            html = _decode(raw, charset)
-            if not _is_listing(final_url, number):
-                vote = "missing"
-            else:
-                videos = parse_videos(html, final_url)
-                if videos:
-                    return PageResult("ok", videos)
-                if LISTING_MARKER in html:
-                    vote = "empty"
+            try:
+                html = _decode(raw, charset)
+                if not _is_listing(final_url, number):
+                    vote = "missing"
                 else:
-                    # Anything else, such as a challenge or error page, is a failure, never the end.
-                    reason = "unexpected page content"
+                    videos = parse_videos(html, final_url)
+                    if videos:
+                        return PageResult("ok", videos)
+                    if LISTING_MARKER in html:
+                        vote = "empty"
+                    else:
+                        # Anything else, such as a challenge or error page, is a failure, never the end.
+                        reason = "unexpected page content"
+            except Exception as exc:
+                # A parser error on one page must not stop the whole run.
+                reason = f"parse error: {type(exc).__name__}"
 
         if vote == "missing":
             missing_votes += 1
@@ -342,7 +359,8 @@ class Checkpoint:
         return self.last_page is not None and all(n in self.pages for n in range(1, self.last_page + 1))
 
     def load(self):
-        # Read the checkpoint file. Ignore it if it is broken or belongs to a different URL.
+        # Read the checkpoint file.
+        # A file that belongs to another profile is never overwritten, because that would lose its resume data.
         if not self.path.exists():
             return
         try:
@@ -350,8 +368,16 @@ class Checkpoint:
         except (OSError, ValueError) as exc:
             log(f"Checkpoint unreadable ({exc}), starting fresh.", "warn")
             return
-        if not isinstance(data, dict) or data.get("source_url") != self.source_url:
-            log("Checkpoint belongs to another URL or is invalid, ignoring it.", "warn")
+        if not isinstance(data, dict):
+            log("Checkpoint is invalid, starting fresh.", "warn")
+            return
+        if data.get("source_url") != self.source_url:
+            if data.get("source_url"):
+                raise ValueError(
+                    f"checkpoint {self.path} belongs to another profile ({data['source_url']}). "
+                    "Use -c with another file name, or -n to replace it."
+                )
+            log("Checkpoint has no source URL, starting fresh.", "warn")
             return
 
         last = data.get("last_page")
@@ -802,7 +828,7 @@ def parse_args(argv=None):
     )
     cli.add_argument(
         "-n", "--no-resume", action="store_true",
-        help="ignore and delete any existing checkpoint, start from scratch",
+        help="ignore and delete the checkpoint file at the checkpoint path, start from scratch",
     )
     cli.add_argument(
         "-k", "--keep-checkpoint", action="store_true",
