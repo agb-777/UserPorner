@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 from xml.sax.saxutils import escape
 
 from colorama import Fore, Style, init
@@ -57,11 +57,14 @@ VIDEO_MARKER = "/video-"
 LISTING_MARKER = "/uploaded-videos/"
 # Only links on this site are counted as videos.
 SITE_HOST = "eporner.com"
+# CSS class of the div that holds the video thumbnails on a listing page.
+_CONTAINER_CLASS = "mb"
 
 # Network settings, in seconds unless noted.
 REQUEST_TIMEOUT = 20
 REQUEST_DELAY = 0.5  # Pause before each request, per worker, to keep the load on the site low.
 RETRY_DELAY = 2  # Multiplied by the attempt number, so retries back off.
+MAX_PAGE_BYTES = 10 * 1024 * 1024  # Larger responses are treated as failures.
 SAFETY_PAGE_LIMIT = 100_000  # Hard stop so the scraper cannot loop forever.
 MAX_WORKERS = 10
 MAX_RETRIES = 10
@@ -77,8 +80,10 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# Characters left alone when a URL is percent-encoded for Markdown.
+URL_SAFE_CHARS = ":/?=&%#+@,;!$'()*"
 # Characters that have a meaning in Markdown and must be escaped inside table cells.
-_MD_SPECIAL = str.maketrans({char: "\\" + char for char in "\\`*_[]<>|"})
+_MD_SPECIAL = str.maketrans({char: "\\" + char for char in "\\`*_[]<>|&"})
 # Control characters that are not whitespace. They can break PDF generation.
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0e-\x1b\x7f]")
 # A CSV cell starting with one of these may be run as a formula by spreadsheet programs.
@@ -189,11 +194,23 @@ class _VideoParser(HTMLParser):
         self._text = []
         self.videos = []  # (url, title, in_container) in page order.
 
+    def finish_link(self):
+        # Close the video link we are inside, if any, and store it.
+        if self._href is None:
+            return
+        # Title order: title attribute, then image alt text, then visible text.
+        title = _clean(self._title or self._alt or "".join(self._text))
+        self.videos.append((self._href, title, self._in_container))
+        self._href = None
+
     def handle_starttag(self, tag, attrs):
         attr = dict(attrs)
         if tag == "div":
-            self._div_stack.append("mb" in (attr.get("class") or "").split())
+            self._div_stack.append(_CONTAINER_CLASS in (attr.get("class") or "").split())
             return
+        if tag == "a" and self._href is not None:
+            # A new link starts before the old one was closed. Browsers close the old one first.
+            self.finish_link()
         if self._href is not None:
             if tag == "img" and not self._alt:
                 self._alt = (attr.get("alt") or "").strip()
@@ -223,12 +240,8 @@ class _VideoParser(HTMLParser):
             if self._div_stack:
                 self._div_stack.pop()
             return
-        if tag != "a" or self._href is None:
-            return
-        # Title order: title attribute, then image alt text, then visible text.
-        title = self._title or self._alt or _clean("".join(self._text))
-        self.videos.append((self._href, title, self._in_container))
-        self._href = None
+        if tag == "a":
+            self.finish_link()
 
 
 def parse_videos(html, page_url_value):
@@ -236,6 +249,7 @@ def parse_videos(html, page_url_value):
     parser = _VideoParser(page_url_value)
     parser.feed(html)
     parser.close()
+    parser.finish_link()
     # Prefer links inside listing containers. Fall back to every video link if the page has none.
     chosen = [item for item in parser.videos if item[2]] or parser.videos
     found = {}
@@ -267,7 +281,10 @@ def _download(url):
     # Download one page. Return (final URL after redirects, raw bytes, declared charset).
     request = urllib.request.Request(url, headers=HEADERS)
     with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-        return response.geturl(), response.read(), response.headers.get_content_charset()
+        raw = response.read(MAX_PAGE_BYTES + 1)
+        if len(raw) > MAX_PAGE_BYTES:
+            raise OSError(f"page is larger than {MAX_PAGE_BYTES // (1024 * 1024)} MB")
+        return response.geturl(), raw, response.headers.get_content_charset()
 
 
 def _decode(raw, charset):
@@ -301,7 +318,7 @@ def fetch_page(base, number, attempts):
             else:
                 reason = f"HTTP {code}"
         except Exception as exc:
-            # Covers timeouts, connection resets, and incomplete reads.
+            # Covers timeouts, connection resets, incomplete reads, and oversized pages.
             reason = type(exc).__name__
         else:
             try:
@@ -393,8 +410,13 @@ class Checkpoint:
         return list(unique.values())
 
     def known_urls(self):
-        # Every video URL stored so far.
-        return {video["url"] for page in self.pages.values() for video in page}
+        # Every video URL stored so far, within the listing.
+        return {
+            video["url"]
+            for number, page in self.pages.items()
+            if self.last_page is None or number <= self.last_page
+            for video in page
+        }
 
     def covers_listing(self):
         # True when the end is known and every page up to it is stored.
@@ -413,24 +435,35 @@ class Checkpoint:
         if not isinstance(data, dict):
             log("Checkpoint is invalid, starting fresh.", "warn")
             return
-        if data.get("source_url") != self.source_url:
-            if data.get("source_url"):
-                raise ValueError(
-                    f"checkpoint {self.path} belongs to another profile ({data['source_url']}). "
-                    "Use -c with another file name, or -n to replace it."
-                )
+
+        source = data.get("source_url")
+        if not isinstance(source, str) or not source:
             log("Checkpoint has no source URL, starting fresh.", "warn")
             return
+        # Compared without case, because file names are not case sensitive on every system.
+        if source.lower() != self.source_url.lower():
+            raise ValueError(
+                f"checkpoint {self.path} belongs to another profile ({source}). "
+                "Use -c with another file name, or -n to replace it."
+            )
 
         last = data.get("last_page")
-        if isinstance(last, int) and not isinstance(last, bool) and 0 <= last <= SAFETY_PAGE_LIMIT:
+        if isinstance(last, int) and not isinstance(last, bool) and 1 <= last <= SAFETY_PAGE_LIMIT:
             self.last_page = last
 
         stored = data.get("pages")
         if isinstance(stored, dict):
             for key, videos in stored.items():
-                if _is_page_key(key) and isinstance(videos, list):
-                    self.pages[int(key)] = [video for video in videos if _is_video(video)]
+                if not (_is_page_key(key) and isinstance(videos, list)):
+                    continue
+                valid = [video for video in videos if _is_video(video)]
+                # A damaged page is dropped so it is fetched again, instead of losing videos silently.
+                if valid and len(valid) == len(videos):
+                    self.pages[int(key)] = valid
+
+        # Pages after the known end are not part of the listing, so they are dropped.
+        if self.last_page is not None:
+            self.pages = {n: page for n, page in self.pages.items() if n <= self.last_page}
 
         if self.pages or self.last_page is not None:
             log(f"Resuming from checkpoint: {len(self.pages)} pages, {len(self.videos)} videos", "success")
@@ -556,7 +589,7 @@ def _write_json(path, records, fieldnames, metadata):
 
 
 def _write_md(path, records, fieldnames, metadata):
-    # Markdown table. URLs are wrapped in <> so they become clickable links.
+    # Markdown table. URLs are percent-encoded and wrapped in <> so they become clickable links.
     headers = ["No", *(FIELD_LABELS[name] for name in fieldnames)]
     alignment = [":--:", *([":--"] * len(fieldnames))]
     lines = [
@@ -575,8 +608,8 @@ def _write_md(path, records, fieldnames, metadata):
         cells = [str(index)]
         for name in fieldnames:
             if name == "url":
-                # A pipe would break the table, so it is replaced with its percent-encoded form.
-                url = _clean(record[name]).replace("|", "%7C")
+                # Encoding removes spaces and <> so the link stays valid and the pipe cannot break the table.
+                url = quote(_clean(record[name]), safe=URL_SAFE_CHARS)
                 cells.append(f"<{url}>")
             else:
                 cells.append(_md_text(record[name]))
@@ -618,7 +651,8 @@ def _write_pdf(path, records, fieldnames, metadata):
         "head", parent=base, fontName="Helvetica-Bold", fontSize=8, leading=10, textColor=colors.white
     )
     cell_style = ParagraphStyle("cell", parent=base, fontSize=7.5, leading=9.5, textColor=colors.black)
-    link_style = ParagraphStyle("link", parent=cell_style, textColor=accent)
+    # URLs have no spaces, so they wrap by character to stay inside their column.
+    link_style = ParagraphStyle("link", parent=cell_style, textColor=accent, wordWrap="CJK")
     index_style = ParagraphStyle("index", parent=cell_style, textColor=muted, alignment=TA_RIGHT)
 
     # Build the table rows. The header row is first.
@@ -706,8 +740,8 @@ def save_records(path, fmt, records, fieldnames, metadata):
 
 
 def resolve_output(raw, fmt):
-    # Add the format extension if the user did not type it.
-    path = Path(raw)
+    # Expand "~", then add the format extension if the user did not type it.
+    path = Path(raw).expanduser()
     if not path.name or path.name in (".", ".."):
         raise ValueError("output must be a file name, not a folder")
     if path.suffix.lower() == f".{fmt}":
@@ -715,13 +749,21 @@ def resolve_output(raw, fmt):
     return path.with_name(path.name + f".{fmt}")
 
 
+def _pdf_ready():
+    # True if reportlab can be imported, which PDF output needs.
+    try:
+        import reportlab  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def ensure_output_ready(path, fmt):
-    # Check the output folder is writable and reportlab is installed before scraping starts.
-    if fmt == "pdf":
-        try:
-            import reportlab  # noqa: F401
-        except ImportError as exc:
-            raise ValueError("format pdf needs reportlab, install it with: pip install reportlab") from exc
+    # Check the output path and dependencies before scraping starts.
+    if path.is_dir():
+        raise ValueError(f"output path is a folder: {path}")
+    if fmt == "pdf" and not _pdf_ready():
+        raise ValueError("format pdf needs reportlab, install it with: pip install reportlab")
     folder = path.parent
     probe = folder / ".write_probe"
     try:
@@ -807,6 +849,8 @@ def run(job):
         # An unfinished run must not replace a file that may hold a complete earlier result.
         log(f"Results are incomplete and {job.output} already exists, so it was not overwritten.", "warn")
     else:
+        if job.output.exists():
+            log(f"Replacing existing file {job.output}", "warn")
         metadata = {
             "source_url": job.url,
             "total_videos": len(records),
@@ -1034,15 +1078,37 @@ def _ask_output():
         print(f"{Fore.YELLOW}Enter a file name, not a folder.{Style.RESET_ALL}")
 
 
+def _ask_format():
+    # Ask for the format. PDF is only accepted when reportlab is installed.
+    while True:
+        fmt = _ask_choice("Format", FORMATS, DEFAULT_FORMAT)
+        if fmt != "pdf" or _pdf_ready():
+            return fmt
+        print(f"{Fore.YELLOW}PDF needs reportlab. Install it with: pip install reportlab{Style.RESET_ALL}")
+
+
 def interactive_job():
-    # Ask for settings in order. Format and fields are only asked if there is an output file.
+    # Ask for settings in order. Checkpoint questions only appear when they apply.
     print(f"{Fore.CYAN}{Style.BRIGHT}Interactive mode{Style.RESET_ALL}")
     url = _ask_url()
+    checkpoint_path = Path(checkpoint_name(url))
+
+    fresh = False
+    if checkpoint_path.exists():
+        choice = _ask_choice(
+            f"Checkpoint found ({checkpoint_path.name}). Resume or start over?",
+            ("resume", "fresh"),
+            "resume",
+        )
+        fresh = choice == "fresh"
+
     output = _ask_output()
-    fmt, fields = DEFAULT_FORMAT, DEFAULT_FIELDS
+    fmt, fields, keep = DEFAULT_FORMAT, DEFAULT_FIELDS, False
     if output:
-        fmt = _ask_choice("Format", FORMATS, DEFAULT_FORMAT)
+        fmt = _ask_format()
         fields = _ask_choice("Fields", FIELD_CHOICES, DEFAULT_FIELDS)
+        keep = _ask_choice("Keep checkpoint after a complete run?", ("no", "yes"), "no") == "yes"
+
     workers = _ask_int("Workers", DEFAULT_WORKERS, 1, MAX_WORKERS)
     attempts = _ask_int("Attempts per page", DEFAULT_RETRIES, 1, MAX_RETRIES)
     return make_job(
@@ -1052,9 +1118,9 @@ def interactive_job():
         output=output or None,
         workers=workers,
         attempts=attempts,
-        checkpoint=checkpoint_name(url),
-        keep_checkpoint=False,
-        fresh=False,
+        checkpoint=str(checkpoint_path),
+        keep_checkpoint=keep,
+        fresh=fresh,
         verbose=False,
     )
 
