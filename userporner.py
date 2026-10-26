@@ -39,6 +39,10 @@ DEFAULT_FORMAT = "txt"
 DEFAULT_FIELDS = "all"
 DEFAULT_WORKERS = 3
 DEFAULT_RETRIES = 3
+# An empty or missing page must be seen at least twice before the listing is treated as ended.
+MIN_RETRIES = 2
+DEFAULT_PER_PAGE = 50
+MAX_PER_PAGE = 500
 FORMATS = ("txt", "csv", "json", "md", "html", "pdf")
 FIELD_CHOICES = ("all", "url")
 # Column order used by every format: title, thumbnail, views, URL.
@@ -100,6 +104,8 @@ HEADERS = {
 URL_SAFE_CHARS = ":/?=&%#+@,;!$'()*"
 # Characters that have a meaning in Markdown and must be escaped inside table cells.
 _MD_SPECIAL = str.maketrans({char: "\\" + char for char in "\\`*_[]<>|&"})
+# Markdown column alignment: centered thumbnails, right-aligned views, left-aligned text.
+_MD_ALIGN = {"thumbnail": ":--:", "views": "--:"}
 # Control characters that are not whitespace. They can break PDF generation.
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0e-\x1b\x7f]")
 # A CSV cell starting with one of these may be run as a formula by spreadsheet programs.
@@ -115,6 +121,7 @@ _HTML_STYLE = """
   :root { --bg: #14171c; --fg: #e6e9ef; --muted: #97a0b0; --line: #2a303b;
           --head: #0d1220; --stripe: #1a1f27; --accent: #7fb2ff; }
 }
+[hidden] { display: none !important; }
 body { margin: 0; padding: 32px 24px; background: var(--bg); color: var(--fg);
        font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
 h1 { font-size: 22px; margin: 0 0 6px; }
@@ -122,16 +129,60 @@ h1 { font-size: 22px; margin: 0 0 6px; }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; }
 th, td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
-th { background: var(--head); color: #ffffff; position: sticky; top: 0; font-size: 12px;
+th { background: var(--head); color: #ffffff; font-size: 12px;
      text-transform: uppercase; letter-spacing: 0.04em; }
 tbody tr:nth-child(even) td { background: var(--stripe); }
 td.num, th.num { text-align: right; color: var(--muted); }
+th.thumb, td.thumb { text-align: center; }
+td.thumb img { display: block; width: 160px; height: auto; margin: 0 auto; border-radius: 4px; }
 td.views, th.views { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-td.thumb img { display: block; width: 160px; height: auto; border-radius: 4px; }
 td.url { word-break: break-all; font-size: 12px; }
 a { color: var(--accent); }
+.pager { display: flex; align-items: center; justify-content: center; gap: 12px; margin: 20px 0; }
+.pager button { font: inherit; padding: 6px 14px; border: 1px solid var(--line); border-radius: 6px;
+                background: var(--head); color: #ffffff; cursor: pointer; }
+.pager button:disabled { opacity: 0.4; cursor: default; }
+.pager span { color: var(--muted); min-width: 220px; text-align: center; }
 footer { margin-top: 24px; color: var(--muted); font-size: 12px; }
 """
+
+# Script for the HTML pager. __PER_PAGE__ is replaced with the chosen number of rows per page.
+_PAGER_SCRIPT = """
+(function () {
+  var perPage = __PER_PAGE__;
+  var rows = Array.prototype.slice.call(document.querySelectorAll("tbody tr"));
+  var total = Math.max(1, Math.ceil(rows.length / perPage));
+  var current = 1;
+  var nav = document.getElementById("pager");
+  var info = document.getElementById("pager-info");
+  var prev = document.getElementById("prev");
+  var next = document.getElementById("next");
+
+  function show() {
+    rows.forEach(function (row, index) {
+      row.hidden = Math.floor(index / perPage) + 1 !== current;
+    });
+    info.textContent = "Page " + current + " of " + total + " (" + perPage + " per page)";
+    prev.disabled = current <= 1;
+    next.disabled = current >= total;
+  }
+
+  prev.addEventListener("click", function () {
+    if (current > 1) { current -= 1; show(); window.scrollTo({ top: 0, behavior: "smooth" }); }
+  });
+  next.addEventListener("click", function () {
+    if (current < total) { current += 1; show(); window.scrollTo({ top: 0, behavior: "smooth" }); }
+  });
+  nav.hidden = false;
+  show();
+})();
+"""
+
+
+class ValidationError(Exception):
+    # A problem with the settings or with a file the user named. The run stops before scraping.
+    pass
+
 
 # ---------------------------------------------------------------------------
 # Logging and stop signal
@@ -574,22 +625,22 @@ class Checkpoint:
         # A run that asked to resume must never quietly start from the beginning instead.
         path = Path(path)
         if not path.exists():
-            raise ValueError(f"resume file not found: {path}")
+            raise ValidationError(f"resume file not found: {path}")
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
-            raise ValueError(f"resume file is unreadable ({exc}): {path}") from exc
+            raise ValidationError(f"resume file is unreadable ({exc}): {path}") from exc
         if not isinstance(data, dict):
-            raise ValueError(f"resume file is not a checkpoint: {path}")
+            raise ValidationError(f"resume file is not a checkpoint: {path}")
 
         source = data.get("source_url")
         if not isinstance(source, str) or not source:
-            raise ValueError(f"resume file has no source URL: {path}")
+            raise ValidationError(f"resume file has no source URL: {path}")
         # Compared without case, because file names are not case sensitive on every system.
         if source.lower() != self.source_url.lower():
-            raise ValueError(f"resume file belongs to another profile ({source}): {path}")
+            raise ValidationError(f"resume file belongs to another profile ({source}): {path}")
         if data.get("format") != CHECKPOINT_FORMAT:
-            raise ValueError(f"resume file was made by an older version and cannot be used: {path}")
+            raise ValidationError(f"resume file was made by an older version and cannot be used: {path}")
 
         last = data.get("last_page")
         if isinstance(last, int) and not isinstance(last, bool) and 1 <= last <= SAFETY_PAGE_LIMIT:
@@ -733,6 +784,9 @@ def crawl(job, checkpoint):
 # ---------------------------------------------------------------------------
 # Output writers
 # ---------------------------------------------------------------------------
+# Every writer takes the same arguments, so save_records can call any of them.
+# images holds PDF pictures keyed by URL, and per_page sets the rows per page in HTML.
+# metadata["status"] is "complete" or "incomplete", so a partial file cannot pass for a full one.
 
 def _plain_value(value):
     # Text for the plain text format. Empty values show a dash.
@@ -741,13 +795,14 @@ def _plain_value(value):
     return _clean(value)
 
 
-def _write_txt(path, records, fieldnames, metadata, images=None):
+def _write_txt(path, records, fieldnames, metadata, images=None, per_page=None):
     # Plain text: one block per video, so it reads well in any editor and needs no viewer.
     lines = [
         "Eporner Video Listing",
         "",
         f"Source: {metadata['source_url']}",
         f"Total videos: {metadata['total_videos']}",
+        f"Status: {metadata['status']}",
         f"Scraped at: {metadata['scraped_at']}",
         f"Author: {metadata['author']}",
         f"Homepage: {metadata['homepage']}",
@@ -776,8 +831,9 @@ def _csv_value(value):
     return value
 
 
-def _write_csv(path, records, fieldnames, metadata, images=None):
+def _write_csv(path, records, fieldnames, metadata, images=None, per_page=None):
     # CSV has no room for metadata without breaking the table, so only records are written.
+    # The status is therefore not stored in CSV. Use JSON or TXT if you need it.
     # utf-8-sig adds a BOM so Excel reads non-Latin characters correctly.
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -786,8 +842,8 @@ def _write_csv(path, records, fieldnames, metadata, images=None):
             writer.writerow({key: _csv_value(value) for key, value in record.items()})
 
 
-def _write_json(path, records, fieldnames, metadata, images=None):
-    # Metadata (including author and homepage) and records together in one JSON object.
+def _write_json(path, records, fieldnames, metadata, images=None, per_page=None):
+    # Metadata (including status, author, and homepage) and records together in one JSON object.
     payload = {**metadata, "records": records}
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -819,15 +875,16 @@ def _md_cell(name, value):
     return _md_text(value)
 
 
-def _write_md(path, records, fieldnames, metadata, images=None):
-    # Markdown table with pictures for thumbnails and clickable URLs.
+def _write_md(path, records, fieldnames, metadata, images=None, per_page=None):
+    # Markdown table with centered pictures for thumbnails and clickable URLs.
     headers = ["No", *(FIELD_LABELS[name] for name in fieldnames)]
-    alignment = [":--:", *("--:" if name == "views" else ":--" for name in fieldnames)]
+    alignment = [":--:", *(_MD_ALIGN.get(name, ":--") for name in fieldnames)]
     lines = [
         "# Eporner Video Listing",
         "",
         f"> **Source:** {metadata['source_url']}  ",
         f"> **Total videos:** {metadata['total_videos']}  ",
+        f"> **Status:** {metadata['status']}  ",
         f"> **Scraped at:** {metadata['scraped_at']}  ",
         f"> **Author:** {metadata['author']}  ",
         f"> **Homepage:** {metadata['homepage']}",
@@ -856,8 +913,10 @@ def _html_cell(name, value):
     return html_escape(_clean(value))
 
 
-def _write_html(path, records, fieldnames, metadata, images=None):
-    # A single HTML file with inline styling. It follows the reader's light or dark setting.
+def _write_html(path, records, fieldnames, metadata, images=None, per_page=DEFAULT_PER_PAGE):
+    # A single HTML file with inline styling. Rows are split into pages, so a long list does not
+    # run down the whole screen. Without JavaScript, every row is shown.
+    per_page = per_page or DEFAULT_PER_PAGE
     head = '<th class="num">No</th>' + "".join(
         f'<th class="{_HTML_CLASS[name]}">{html_escape(FIELD_LABELS[name])}</th>' for name in fieldnames
     )
@@ -869,6 +928,14 @@ def _write_html(path, records, fieldnames, metadata, images=None):
         )
         rows.append("<tr>" + "".join(cells) + "</tr>")
     homepage = html_escape(metadata["homepage"], quote=True)
+    pager = "\n".join([
+        '<nav class="pager" id="pager" hidden>',
+        '<button type="button" id="prev">Previous</button>',
+        '<span id="pager-info"></span>',
+        '<button type="button" id="next">Next</button>',
+        "</nav>",
+    ])
+    script = _PAGER_SCRIPT.replace("__PER_PAGE__", str(int(per_page)))
     page = "\n".join([
         "<!DOCTYPE html>",
         '<html lang="en">',
@@ -882,6 +949,7 @@ def _write_html(path, records, fieldnames, metadata, images=None):
         "<h1>Eporner Video Listing</h1>",
         f'<p class="meta">Source: {html_escape(metadata["source_url"])} &middot; '
         f'Total videos: {metadata["total_videos"]} &middot; '
+        f'Status: {html_escape(metadata["status"])} &middot; '
         f'Scraped at: {html_escape(metadata["scraped_at"])}</p>',
         '<div class="table-wrap"><table>',
         f"<thead><tr>{head}</tr></thead>",
@@ -889,6 +957,8 @@ def _write_html(path, records, fieldnames, metadata, images=None):
         *rows,
         "</tbody>",
         "</table></div>",
+        pager,
+        f"<script>{script}</script>",
         f'<footer>Author: {html_escape(metadata["author"])} &middot; '
         f'<a href="{homepage}" rel="noopener noreferrer">{html_escape(metadata["homepage"])}</a></footer>',
         "</body>",
@@ -897,10 +967,10 @@ def _write_html(path, records, fieldnames, metadata, images=None):
     path.write_text(page + "\n", encoding="utf-8")
 
 
-def _write_pdf(path, records, fieldnames, metadata, images=None):
+def _write_pdf(path, records, fieldnames, metadata, images=None, per_page=None):
     # reportlab is imported here so it is only needed when PDF output is used.
     from reportlab.lib import colors
-    from reportlab.lib.enums import TA_RIGHT
+    from reportlab.lib.enums import TA_CENTER, TA_RIGHT
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.utils import ImageReader
@@ -938,12 +1008,13 @@ def _write_pdf(path, records, fieldnames, metadata, images=None):
     head_style = ParagraphStyle(
         "head", parent=base, fontName="Helvetica-Bold", fontSize=8, leading=10, textColor=colors.white
     )
+    head_center_style = ParagraphStyle("headc", parent=head_style, alignment=TA_CENTER)
     cell_style = ParagraphStyle("cell", parent=base, fontSize=7.5, leading=9.5, textColor=colors.black)
     # URLs have no spaces, so they wrap by character to stay inside their column.
     link_style = ParagraphStyle("link", parent=cell_style, textColor=accent, wordWrap="CJK")
     views_style = ParagraphStyle("views", parent=cell_style, alignment=TA_RIGHT)
     index_style = ParagraphStyle("index", parent=cell_style, textColor=muted, alignment=TA_RIGHT)
-    placeholder_style = ParagraphStyle("placeholder", parent=cell_style, textColor=muted)
+    placeholder_style = ParagraphStyle("placeholder", parent=cell_style, textColor=muted, alignment=TA_CENTER)
     field_styles = {"title": cell_style, "url": link_style, "views": views_style}
 
     def thumbnail_cell(url):
@@ -961,8 +1032,13 @@ def _write_pdf(path, records, fieldnames, metadata, images=None):
         return Image(io.BytesIO(data), width=width * scale, height=height * scale)
 
     # Build the table rows. The header row is first.
-    headers = ["No", *(FIELD_LABELS[name] for name in fieldnames)]
-    rows = [[Paragraph(escape(header), head_style) for header in headers]]
+    headers = [FIELD_LABELS[name] for name in fieldnames]
+    header_cells = [Paragraph("No", head_style)]
+    header_cells.extend(
+        Paragraph(escape(label), head_center_style if name == "thumbnail" else head_style)
+        for label, name in zip(headers, fieldnames)
+    )
+    rows = [header_cells]
     for index, record in enumerate(records, start=1):
         row = [Paragraph(str(index), index_style)]
         for name in fieldnames:
@@ -974,30 +1050,30 @@ def _write_pdf(path, records, fieldnames, metadata, images=None):
                 row.append(Paragraph(escape(text), field_styles[name]))
         rows.append(row)
 
-    # Table styling: navy header, striped rows, thin grid.
+    # Table styling: navy header, striped rows, thin grid. Thumbnails are centered in their column.
     table = Table(rows, colWidths=widths, repeatRows=1)  # repeatRows repeats the header on each page.
-    table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), navy),
-                ("LINEBELOW", (0, 0), (-1, 0), 1.2, accent),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, stripe]),
-                ("GRID", (0, 0), (-1, -1), 0.25, rule),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-                ("LEFTPADDING", (0, 0), (-1, -1), 5),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-            ]
-        )
-    )
+    style_commands = [
+        ("BACKGROUND", (0, 0), (-1, 0), navy),
+        ("LINEBELOW", (0, 0), (-1, 0), 1.2, accent),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, stripe]),
+        ("GRID", (0, 0), (-1, -1), 0.25, rule),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+    ]
+    if "thumbnail" in fieldnames:
+        thumb_column = fieldnames.index("thumbnail") + 1  # Column 0 is the number column.
+        style_commands.append(("ALIGN", (thumb_column, 0), (thumb_column, -1), "CENTER"))
+    table.setStyle(TableStyle(style_commands))
 
     story = [
         Paragraph("Eporner Video Listing", title_style),
         Paragraph(
             escape(
                 f"Source: {metadata['source_url']}  |  Total videos: {metadata['total_videos']}  |  "
-                f"Scraped at: {metadata['scraped_at']}"
+                f"Status: {metadata['status']}  |  Scraped at: {metadata['scraped_at']}"
             ),
             meta_style,
         ),
@@ -1044,11 +1120,11 @@ WRITERS = {
 }
 
 
-def save_records(path, fmt, records, fieldnames, metadata, images):
+def save_records(path, fmt, records, fieldnames, metadata, images, per_page):
     # Write to a .tmp file first, then rename it. If writing fails, delete the .tmp file.
     tmp = path.with_name(path.name + ".tmp")
     try:
-        WRITERS[fmt](tmp, records, fieldnames, metadata, images)
+        WRITERS[fmt](tmp, records, fieldnames, metadata, images, per_page)
         tmp.replace(path)
     except BaseException:
         tmp.unlink(missing_ok=True)
@@ -1057,15 +1133,22 @@ def save_records(path, fmt, records, fieldnames, metadata, images):
 
 def resolve_output(raw, fmt):
     # Expand "~", then add the format extension if the user did not type it.
-    # A folder name is refused, so a folder is never mistaken for a file name.
+    # A folder name is refused, and a name that ends in a different format is refused too,
+    # so "hasil.json" with -f md is not silently saved as "hasil.json.md".
     text = raw.strip()
     if text.endswith(("/", "\\")) or text in ("~", ".", ".."):
-        raise ValueError("output must be a file name, not a folder")
+        raise ValidationError("output must be a file name, not a folder")
     path = Path(text).expanduser()
     if not path.name or path.name in (".", ".."):
-        raise ValueError("output must be a file name, not a folder")
-    if path.suffix.lower() == f".{fmt}":
+        raise ValidationError("output must be a file name, not a folder")
+    suffix = path.suffix.lower().lstrip(".")
+    if suffix == fmt:
         return path
+    if suffix in FORMATS:
+        raise ValidationError(
+            f"the name ends in .{suffix} but -f is {fmt}. "
+            f"Use a name ending in .{fmt}, or a name without an extension"
+        )
     return path.with_name(path.name + f".{fmt}")
 
 
@@ -1085,7 +1168,7 @@ def _check_folder_writable(folder):
         folder.mkdir(parents=True, exist_ok=True)
         probe.write_text("", encoding="utf-8")
     except OSError as exc:
-        raise ValueError(f"folder is not writable: {folder} ({exc})") from exc
+        raise ValidationError(f"folder is not writable: {folder} ({exc})") from exc
     finally:
         probe.unlink(missing_ok=True)
 
@@ -1093,9 +1176,9 @@ def _check_folder_writable(folder):
 def ensure_output_ready(path, fmt):
     # Check the output path and dependencies before scraping starts.
     if path.is_dir():
-        raise ValueError(f"output path is a folder: {path}")
+        raise ValidationError(f"output path is a folder: {path}")
     if fmt == "pdf" and not _pdf_ready():
-        raise ValueError("format pdf needs reportlab, install it with: pip install reportlab")
+        raise ValidationError("format pdf needs reportlab, install it with: pip install reportlab")
     _check_folder_writable(path.parent)
 
 
@@ -1112,6 +1195,7 @@ class Job:
     fields: str
     workers: int
     attempts: int  # Tries per page before it is reported as failed.
+    per_page: int  # Rows per page in HTML output.
     save_path: Path | None  # Where progress is written, or None for no checkpoint file.
     resume_path: Path | None  # Where progress is read from, or None to start from the beginning.
     verbose: bool
@@ -1175,6 +1259,7 @@ def run(job):
         metadata = {
             "source_url": job.url,
             "total_videos": len(records),
+            "status": "complete" if complete else "incomplete",
             "scraped_at": datetime.now().isoformat(),
             "fields": fieldnames,
             "author": AUTHOR,
@@ -1185,14 +1270,18 @@ def run(job):
         if job.fmt == "pdf" and "thumbnail" in fieldnames:
             images = _download_thumbnails(job, records)
         log(f"Saving {len(records)} records to {job.output} ({job.fmt})...", "step")
-        save_records(job.output, job.fmt, records, fieldnames, metadata, images)
+        save_records(job.output, job.fmt, records, fieldnames, metadata, images, job.per_page)
         log(f"Saved to {job.output}", "success")
         saved = True
 
     # Checkpoint files are never deleted automatically. They stay until the user removes them.
     if not complete:
         if job.save_path is not None:
-            log(f"Results are incomplete. Progress kept in {job.save_path}, run with -R {job.save_path} to continue.", "warn")
+            log(
+                f"Results are incomplete. Progress kept in {job.save_path}, "
+                f"run with -R {job.save_path} to continue.",
+                "warn",
+            )
         else:
             log("Results are incomplete and no checkpoint was saved. Use -s FILE next time to keep progress.", "warn")
     elif job.save_path is not None:
@@ -1252,12 +1341,16 @@ def parse_args(argv=None):
         help=f"all = title, thumbnail, views, url; url = url only (default: {DEFAULT_FIELDS})",
     )
     parser.add_argument(
+        "-p", "--per-page", type=_bounded(1, MAX_PER_PAGE), default=None,
+        help=f"rows per page in HTML output, 1-{MAX_PER_PAGE} (HTML only, default: {DEFAULT_PER_PAGE})",
+    )
+    parser.add_argument(
         "-w", "--workers", type=_bounded(1, MAX_WORKERS), default=DEFAULT_WORKERS,
         help=f"parallel requests, 1-{MAX_WORKERS} (default: {DEFAULT_WORKERS})",
     )
     parser.add_argument(
-        "-r", "--retries", type=_bounded(1, MAX_RETRIES), default=DEFAULT_RETRIES,
-        help=f"attempts per page, 1-{MAX_RETRIES} (default: {DEFAULT_RETRIES})",
+        "-r", "--retries", type=_bounded(MIN_RETRIES, MAX_RETRIES), default=DEFAULT_RETRIES,
+        help=f"attempts per page, {MIN_RETRIES}-{MAX_RETRIES} (default: {DEFAULT_RETRIES})",
     )
     parser.add_argument(
         "-s", "--save-checkpoint", metavar="FILE",
@@ -1281,6 +1374,8 @@ def parse_args(argv=None):
                         ("-R/--resume", args.resume)):
         if value is not None and not value.strip():
             parser.error(f"{flag} must not be empty")
+    if args.per_page is not None and args.format != "html":
+        parser.error("-p/--per-page only applies to -f html")
     return args
 
 
@@ -1302,10 +1397,10 @@ def job_from_args(args):
 
     if save_path is not None:
         if save_path.is_dir():
-            raise ValueError(f"checkpoint path is a folder: {save_path}")
+            raise ValidationError(f"checkpoint path is a folder: {save_path}")
         # Saving must never overwrite an older checkpoint, unless that is the file being resumed.
         if save_path.exists() and not _same_file(save_path, resume_path):
-            raise ValueError(
+            raise ValidationError(
                 f"{save_path} already exists. Use -R {save_path} to continue it, "
                 "or choose another name for -s."
             )
@@ -1313,7 +1408,7 @@ def job_from_args(args):
 
     # The output file would replace the checkpoint, and the next resume would then fail.
     if output is not None and (_same_file(output, save_path) or _same_file(output, resume_path)):
-        raise ValueError("the output file cannot be the same as the checkpoint file")
+        raise ValidationError("the output file cannot be the same as the checkpoint file")
 
     url = normalize_profile_url(args.url)
     return Job(
@@ -1323,6 +1418,7 @@ def job_from_args(args):
         fields=args.fields,
         workers=args.workers,
         attempts=args.retries,
+        per_page=args.per_page if args.per_page is not None else DEFAULT_PER_PAGE,
         save_path=save_path,
         resume_path=resume_path,
         verbose=args.verbose,
@@ -1382,7 +1478,7 @@ def main(argv=None):
         else:
             log("Stopped by user. Nothing was saved, use -s FILE next time to keep progress.", "warn")
         return 130
-    except ValueError as exc:
+    except ValidationError as exc:
         log(f"Validation error: {exc}", "error")
         return 2
     except Exception as exc:
