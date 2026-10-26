@@ -1,5 +1,5 @@
 # userporner.py
-# Export the video list of an Eporner profile to CSV, JSON, Markdown, or PDF.
+# Export the video list of an Eporner profile to TXT, CSV, JSON, Markdown, HTML, or PDF.
 # Author: agb-777
 # Homepage: https://github.com/agb-777/userporner
 
@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import re
 import sys
@@ -14,9 +15,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
+from html import escape as html_escape
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlsplit
@@ -31,15 +33,25 @@ from colorama import Fore, Style, init
 AUTHOR = "agb-777"
 HOMEPAGE = "https://github.com/agb-777/userporner"
 
-# Each profile gets its own checkpoint file, so two profiles never overwrite each other.
-CHECKPOINT_TEMPLATE = ".scraper_checkpoint_{}.json"
-DEFAULT_FORMAT = "csv"
+# Version of the checkpoint layout. Older checkpoints lack thumbnail and views, so they cannot be resumed.
+CHECKPOINT_FORMAT = 2
+DEFAULT_FORMAT = "txt"
 DEFAULT_FIELDS = "all"
 DEFAULT_WORKERS = 3
 DEFAULT_RETRIES = 3
-FORMATS = ("csv", "json", "md", "pdf")
+FORMATS = ("txt", "csv", "json", "md", "html", "pdf")
 FIELD_CHOICES = ("all", "url")
-FIELD_LABELS = {"title": "Title", "url": "URL"}
+# Column order used by every format: title, thumbnail, views, URL.
+ALL_FIELDS = ("title", "thumbnail", "views", "url")
+FIELD_LABELS = {"title": "Title", "thumbnail": "Thumbnail", "views": "Views", "url": "URL"}
+# CSS class of each column in the HTML table.
+_HTML_CLASS = {"title": "title", "thumbnail": "thumb", "views": "views", "url": "url"}
+
+# PDF column sizes. Fixed columns have a set width in points, flexible columns share the rest.
+THUMB_BOX = (120, 68)  # Largest thumbnail drawn in the PDF, in points.
+PDF_FIXED_WIDTHS = {"thumbnail": THUMB_BOX[0] + 12, "views": 60}
+PDF_FLEX_WEIGHTS = {"title": 0.6, "url": 0.4}
+MAX_IMAGE_BYTES = 1024 * 1024  # Thumbnails larger than this are skipped in the PDF.
 
 # A username: letters, digits, underscore, dash, with single dots between parts.
 USERNAME = r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*"
@@ -57,8 +69,12 @@ VIDEO_MARKER = "/video-"
 LISTING_MARKER = "/uploaded-videos/"
 # Only links on this site are counted as videos.
 SITE_HOST = "eporner.com"
-# CSS class of the div that holds the video thumbnails on a listing page.
+# CSS class of the div that holds one video on a listing page.
 _CONTAINER_CLASS = "mb"
+# CSS class of the span that holds the view count.
+_VIEWS_CLASS = "mbvie"
+# A view count written as plain digits, with optional thousands separators.
+_PLAIN_NUMBER = re.compile(r"\d[\d,\s]*")
 
 # Network settings, in seconds unless noted.
 REQUEST_TIMEOUT = 20
@@ -91,6 +107,31 @@ _CSV_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
 
 # Reasons used in log messages when a page marks the end of the listing.
 END_REASONS = {"missing": "does not exist", "end": "is empty"}
+
+_HTML_STYLE = """
+:root { color-scheme: light dark; --bg: #f6f7f9; --fg: #1b1f24; --muted: #5b6577; --line: #d9dee7;
+        --head: #1f2a44; --stripe: #eef2f7; --accent: #2f6db5; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #14171c; --fg: #e6e9ef; --muted: #97a0b0; --line: #2a303b;
+          --head: #0d1220; --stripe: #1a1f27; --accent: #7fb2ff; }
+}
+body { margin: 0; padding: 32px 24px; background: var(--bg); color: var(--fg);
+       font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+h1 { font-size: 22px; margin: 0 0 6px; }
+.meta { color: var(--muted); margin: 0 0 20px; }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
+th { background: var(--head); color: #ffffff; position: sticky; top: 0; font-size: 12px;
+     text-transform: uppercase; letter-spacing: 0.04em; }
+tbody tr:nth-child(even) td { background: var(--stripe); }
+td.num, th.num { text-align: right; color: var(--muted); }
+td.views, th.views { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.thumb img { display: block; width: 160px; height: auto; border-radius: 4px; }
+td.url { word-break: break-all; font-size: 12px; }
+a { color: var(--accent); }
+footer { margin-top: 24px; color: var(--muted); font-size: 12px; }
+"""
 
 # ---------------------------------------------------------------------------
 # Logging and stop signal
@@ -135,12 +176,6 @@ def normalize_profile_url(raw):
     return f"https://www.eporner.com/profile/{username}/uploaded-videos/"
 
 
-def checkpoint_name(listing_url):
-    # Build the default checkpoint file name for one profile.
-    username = listing_url.split("/profile/", 1)[1].split("/", 1)[0]
-    return CHECKPOINT_TEMPLATE.format(username)
-
-
 def page_url(base, number):
     # Page 1 is the base URL. Other pages are base + number + "/".
     return base if number == 1 else f"{base}{number}/"
@@ -158,6 +193,11 @@ def _on_site(url):
     return host == SITE_HOST or host.endswith("." + SITE_HOST)
 
 
+def _safe_image_url(url):
+    # Only http and https image links are kept. Anything else becomes an empty value.
+    return url if urlsplit(url).scheme in ("http", "https") else ""
+
+
 def _is_listing(final_url, number):
     # A response only counts as page N if it is a listing URL for that same page number.
     # A redirect to the home page or another section is not a listing.
@@ -173,92 +213,137 @@ def _clean(value):
     return " ".join(_CONTROL_CHARS.sub(" ", str(value)).split())
 
 
+def _classes(attr):
+    # The list of CSS classes on an element.
+    return (attr.get("class") or "").split()
+
+
+def _to_int(text):
+    # Turn "11,137" into 11137. Return None for anything that is not a plain number, such as "1.2K".
+    text = (text or "").strip()
+    if not _PLAIN_NUMBER.fullmatch(text):
+        return None
+    return int(re.sub(r"\D", "", text))
+
+
 def _urls(videos):
-    # The set of video URLs in a list of {title, url} dictionaries.
+    # The set of video URLs in a list of video dictionaries.
     return {video["url"] for video in videos}
 
 
 class _VideoParser(HTMLParser):
-    # Collects video links from one listing page.
-    # Each link is tagged with whether it sits inside a div with class "mb",
-    # which is the listing container the browser version used.
+    # Reads one listing page into cards. A card is one div with class "mb" that holds a video
+    # link, a thumbnail, and a view count. Video links outside any card are kept as a fallback
+    # for pages that use a different layout.
 
     def __init__(self, base_url):
         super().__init__(convert_charrefs=True)
         self._base = base_url
-        self._div_stack = []  # One flag per open div: True if it is a listing container.
-        self._href = None  # Absolute URL of the video link we are inside, or None.
-        self._in_container = False
-        self._title = ""
-        self._alt = ""
-        self._text = []
-        self.videos = []  # (url, title, in_container) in page order.
-
-    def finish_link(self):
-        # Close the video link we are inside, if any, and store it.
-        if self._href is None:
-            return
-        # Title order: title attribute, then image alt text, then visible text.
-        title = _clean(self._title or self._alt or "".join(self._text))
-        self.videos.append((self._href, title, self._in_container))
-        self._href = None
+        self._stack = []  # One flag per open div: True if that div starts a card.
+        self._card = None  # The card being read, or None.
+        self._link = None  # Absolute URL of the video link being read, or None.
+        self._link_title = ""  # Title attribute of the current link.
+        self._link_alt = ""  # Alt text of the image inside the current link.
+        self._link_text = []  # Visible text of the current link.
+        self._views_open = False  # True while reading inside the views span.
+        self.cards = []  # Finished cards, in page order.
+        self.loose = []  # Video links outside any card, in page order.
 
     def handle_starttag(self, tag, attrs):
         attr = dict(attrs)
         if tag == "div":
-            self._div_stack.append(_CONTAINER_CLASS in (attr.get("class") or "").split())
-            return
-        if tag == "a" and self._href is not None:
+            starts_card = self._card is None and _CONTAINER_CLASS in _classes(attr)
+            if starts_card:
+                self._card = {"url": "", "title": "", "thumbnail": "", "views_text": ""}
+            self._stack.append(starts_card)
+        elif tag == "a":
             # A new link starts before the old one was closed. Browsers close the old one first.
-            self.finish_link()
-        if self._href is not None:
-            if tag == "img" and not self._alt:
-                self._alt = (attr.get("alt") or "").strip()
-            return
-        if tag != "a":
-            return
-        href = attr.get("href") or ""
-        if VIDEO_MARKER not in href:
-            return
-        # Relative links are resolved against the page URL, like a browser does.
-        absolute = urljoin(self._base, href)
-        # Ignore video-looking links that point to other sites, such as ads.
-        if not _on_site(absolute):
-            return
-        self._href = absolute
-        self._in_container = any(self._div_stack)
-        self._title = (attr.get("title") or "").strip()
-        self._alt = ""
-        self._text = []
-
-    def handle_data(self, data):
-        if self._href is not None:
-            self._text.append(data)
+            self._close_link()
+            href = attr.get("href") or ""
+            if VIDEO_MARKER in href:
+                # Relative links are resolved against the page URL, like a browser does.
+                absolute = urljoin(self._base, href)
+                # Ignore video-looking links that point to other sites, such as ads.
+                if _on_site(absolute):
+                    self._link = absolute
+                    self._link_title = (attr.get("title") or "").strip()
+                    self._link_alt = ""
+                    self._link_text = []
+        elif tag == "img" and self._link is not None:
+            if not self._link_alt:
+                self._link_alt = (attr.get("alt") or "").strip()
+            if self._card is not None and not self._card["thumbnail"]:
+                src = (attr.get("src") or "").strip()
+                if src:
+                    self._card["thumbnail"] = _safe_image_url(urljoin(self._base, src))
+        elif tag == "span" and self._card is not None and _VIEWS_CLASS in _classes(attr):
+            self._views_open = True
 
     def handle_endtag(self, tag):
-        if tag == "div":
-            if self._div_stack:
-                self._div_stack.pop()
-            return
         if tag == "a":
-            self.finish_link()
+            self._close_link()
+        elif tag == "span":
+            self._views_open = False
+        elif tag == "div" and self._stack:
+            self._close_link()
+            if self._stack.pop():
+                self._finish_card()
+
+    def handle_data(self, data):
+        if self._views_open and self._card is not None:
+            self._card["views_text"] += data
+        elif self._link is not None:
+            self._link_text.append(data)
+
+    def _close_link(self):
+        # Store the current video link in the card, or in the fallback list if it has no card.
+        if self._link is None:
+            return
+        # Title order: title attribute, then image alt text, then visible text.
+        title = _clean(self._link_title or self._link_alt or "".join(self._link_text))
+        if self._card is None:
+            self.loose.append({"url": self._link, "title": title, "thumbnail": "", "views_text": ""})
+        else:
+            if not self._card["url"]:
+                self._card["url"] = self._link
+            if not self._card["title"]:
+                self._card["title"] = title
+        self._link = None
+
+    def _finish_card(self):
+        card, self._card = self._card, None
+        if card is not None and card["url"]:
+            self.cards.append(card)
+
+    def finish(self):
+        # Close anything still open when the page ends, such as a card with a missing closing tag.
+        self._close_link()
+        if self._card is not None:
+            self._finish_card()
 
 
 def parse_videos(html, page_url_value):
-    # Return a list of {title, url} dictionaries from one listing page.
+    # Return a list of {title, url, thumbnail, views} dictionaries from one listing page.
     parser = _VideoParser(page_url_value)
     parser.feed(html)
     parser.close()
-    parser.finish_link()
-    # Prefer links inside listing containers. Fall back to every video link if the page has none.
-    chosen = [item for item in parser.videos if item[2]] or parser.videos
+    parser.finish()
+    # Prefer listing cards. Fall back to loose video links if the page has no cards.
+    source = parser.cards or parser.loose
     found = {}
-    for url, title, _ in chosen:
-        known = found.get(url, "")
-        # Keep the first non-empty title seen for each URL.
-        if url not in found or (title and not known):
-            found[url] = title
-    return [{"title": title, "url": url} for url, title in found.items()]
+    for item in source:
+        entry = found.setdefault(
+            item["url"],
+            {"title": "", "url": item["url"], "thumbnail": "", "views": None},
+        )
+        # Keep the first non-empty value seen for each field.
+        if not entry["title"]:
+            entry["title"] = _clean(item["title"])
+        if not entry["thumbnail"]:
+            entry["thumbnail"] = item["thumbnail"]
+        if entry["views"] is None:
+            entry["views"] = _to_int(item["views_text"])
+    return list(found.values())
 
 
 # ---------------------------------------------------------------------------
@@ -322,14 +407,14 @@ def fetch_page(base, number, attempts):
             reason = type(exc).__name__
         else:
             try:
-                html = _decode(raw, charset)
+                page_html = _decode(raw, charset)
                 if not _is_listing(final_url, number):
                     vote = "missing"
                 else:
-                    videos = parse_videos(html, final_url)
+                    videos = parse_videos(page_html, final_url)
                     if videos:
                         return PageResult("ok", videos)
-                    if LISTING_MARKER in html:
+                    if LISTING_MARKER in page_html:
                         vote = "empty"
                     else:
                         # Anything else, such as a challenge or error page, is a failure, never the end.
@@ -370,17 +455,78 @@ def _fetch_batch(job, batch):
         executor.shutdown(wait=False, cancel_futures=True)
 
 
+def _is_jpeg_or_png(data):
+    # The PDF writer can only draw JPEG and PNG images without extra libraries.
+    return data.startswith(b"\xff\xd8\xff") or data.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def _fetch_image(url):
+    # Download one thumbnail for the PDF. Return the bytes, or None if it is missing or not supported.
+    # Any failure is treated as a missing picture, so one bad image cannot stop the run.
+    if _STOP.wait(REQUEST_DELAY):
+        return None
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": USER_AGENT, "Accept": "image/jpeg,image/png,*/*;q=0.5"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+            if not response.headers.get_content_type().startswith("image/"):
+                return None
+            data = response.read(MAX_IMAGE_BYTES + 1)
+    except Exception:
+        return None
+    if len(data) > MAX_IMAGE_BYTES or not _is_jpeg_or_png(data):
+        return None
+    return data
+
+
+def _download_thumbnails(job, records):
+    # Pictures for the PDF are downloaded in parallel, with the same worker count as the pages.
+    urls = sorted({record["thumbnail"] for record in records if record.get("thumbnail")})
+    if not urls:
+        return {}
+    log(f"Downloading {len(urls)} thumbnails for the PDF...", "step")
+    images = {}
+    executor = ThreadPoolExecutor(max_workers=job.workers)
+    try:
+        futures = {executor.submit(_fetch_image, url): url for url in urls}
+        done = 0
+        for future in as_completed(futures):
+            data = future.result()
+            if data is not None:
+                images[futures[future]] = data
+            done += 1
+            if done % 100 == 0 or done == len(urls):
+                log(f"Thumbnails: {done}/{len(urls)}", "dim")
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    failed = len(urls) - len(images)
+    if failed:
+        log(f"{failed} thumbnails could not be downloaded and will show as '-' in the PDF.", "warn")
+    return images
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint
 # ---------------------------------------------------------------------------
 
 def _is_video(item):
-    # Check that a stored item has the right shape before using it.
+    # Check that a stored video has the right shape and points to this site before using it.
+    # A checkpoint can be edited by hand, so nothing from it is trusted without these checks.
+    if not isinstance(item, dict):
+        return False
+    url = item.get("url")
+    thumbnail = item.get("thumbnail")
+    views = item.get("views")
     return (
-        isinstance(item, dict)
-        and isinstance(item.get("url"), str)
-        and bool(item["url"])
+        isinstance(url, str)
+        and bool(url)
+        and _on_site(url)
         and isinstance(item.get("title"), str)
+        and isinstance(thumbnail, str)
+        and (thumbnail == "" or _safe_image_url(thumbnail) == thumbnail)
+        and (views is None or (isinstance(views, int) and not isinstance(views, bool)))
     )
 
 
@@ -390,10 +536,11 @@ def _is_page_key(key):
 
 
 class Checkpoint:
-    # Saves each finished page to disk so an interrupted run can resume.
+    # Keeps progress for one profile. Progress is only written to disk when a save path is given,
+    # and it is only read from disk when a resume path is given. Nothing is implicit.
 
-    def __init__(self, path, source_url):
-        self.path = Path(path)
+    def __init__(self, save_path, source_url):
+        self.save_path = Path(save_path) if save_path else None
         self.source_url = source_url  # The checkpoint only applies to this URL.
         self.pages = {}  # {page number: [videos]}
         self.last_page = None  # Set once the end of the listing is confirmed.
@@ -422,30 +569,27 @@ class Checkpoint:
         # True when the end is known and every page up to it is stored.
         return self.last_page is not None and all(n in self.pages for n in range(1, self.last_page + 1))
 
-    def load(self):
-        # Read the checkpoint file.
-        # A file that belongs to another profile is never overwritten, because that would lose its resume data.
-        if not self.path.exists():
-            return
+    def load(self, path):
+        # Read progress from a file the user named with -R. Every problem is an error.
+        # A run that asked to resume must never quietly start from the beginning instead.
+        path = Path(path)
+        if not path.exists():
+            raise ValueError(f"resume file not found: {path}")
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
-            log(f"Checkpoint unreadable ({exc}), starting fresh.", "warn")
-            return
+            raise ValueError(f"resume file is unreadable ({exc}): {path}") from exc
         if not isinstance(data, dict):
-            log("Checkpoint is invalid, starting fresh.", "warn")
-            return
+            raise ValueError(f"resume file is not a checkpoint: {path}")
 
         source = data.get("source_url")
         if not isinstance(source, str) or not source:
-            log("Checkpoint has no source URL, starting fresh.", "warn")
-            return
+            raise ValueError(f"resume file has no source URL: {path}")
         # Compared without case, because file names are not case sensitive on every system.
         if source.lower() != self.source_url.lower():
-            raise ValueError(
-                f"checkpoint {self.path} belongs to another profile ({source}). "
-                "Use -c with another file name, or -n to replace it."
-            )
+            raise ValueError(f"resume file belongs to another profile ({source}): {path}")
+        if data.get("format") != CHECKPOINT_FORMAT:
+            raise ValueError(f"resume file was made by an older version and cannot be used: {path}")
 
         last = data.get("last_page")
         if isinstance(last, int) and not isinstance(last, bool) and 1 <= last <= SAFETY_PAGE_LIMIT:
@@ -465,38 +609,36 @@ class Checkpoint:
         if self.last_page is not None:
             self.pages = {n: page for n, page in self.pages.items() if n <= self.last_page}
 
-        if self.pages or self.last_page is not None:
-            log(f"Resuming from checkpoint: {len(self.pages)} pages, {len(self.videos)} videos", "success")
+        log(f"Resuming from {path}: {len(self.pages)} pages, {len(self.videos)} videos", "success")
 
     def record(self, number, videos):
-        # Store one page and save the whole checkpoint.
+        # Store one page and save progress if a save path was given.
         self.pages[number] = videos
         self._save()
 
     def set_last_page(self, number):
-        # Mark the end of the listing and save it.
+        # Mark the end of the listing and save progress if a save path was given.
         self.last_page = number
         self._save()
 
-    def discard(self):
-        # Delete the checkpoint file.
-        self.path.unlink(missing_ok=True)
-
     def _save(self):
-        # Write to a .tmp file first, then rename it. This prevents a half-written checkpoint.
+        # Do nothing unless the user asked for a checkpoint file with -s.
+        if self.save_path is None:
+            return
         payload = {
+            "format": CHECKPOINT_FORMAT,
             "source_url": self.source_url,
             "timestamp": datetime.now().isoformat(),
             "last_page": self.last_page,
             "pages": {str(number): videos for number, videos in sorted(self.pages.items())},
         }
-        tmp = self.path.with_name(self.path.name + ".tmp")
+        # Write to a .tmp file first, then rename it. This prevents a half-written checkpoint.
+        tmp = self.save_path.with_name(self.save_path.name + ".tmp")
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            tmp.replace(self.path)
+            tmp.replace(self.save_path)
         except OSError as exc:
-            log(f"Checkpoint could not be saved ({exc}); resume may not be available.", "warn")
+            raise OSError(f"checkpoint could not be saved to {self.save_path}: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -509,25 +651,46 @@ def _already_seen(checkpoint, videos):
     return bool(videos) and _urls(videos) <= checkpoint.known_urls()
 
 
+def _next_batch(checkpoint, workers):
+    # The next pages to fetch, in order. Pages already stored are skipped, so a gap in a
+    # checkpoint is filled without refetching pages that are already known.
+    batch = []
+    number = 1
+    while len(batch) < workers and number <= SAFETY_PAGE_LIMIT:
+        if checkpoint.last_page is not None and number > checkpoint.last_page:
+            break
+        if number not in checkpoint.pages:
+            batch.append(number)
+        number += 1
+    return batch
+
+
+def _later_pages_stored(checkpoint, end_page):
+    # True if any page after end_page is already stored. That would contradict an end at end_page.
+    return any(number > end_page for number in checkpoint.pages)
+
+
+def _failure_message(job, number, reason):
+    # Explain how to continue, depending on whether progress is being saved.
+    if job.save_path is not None:
+        hint = f"run again with -R {job.save_path} to continue"
+    else:
+        hint = "no progress was saved, use -s FILE next time to be able to continue"
+    return f"page {number} failed ({reason}); {hint}"
+
+
 def crawl(job, checkpoint):
     # Fetch pages in parallel batches until the end of the listing is confirmed.
     # Return (complete, error_message).
     while True:
-        if checkpoint.last_page is not None:
-            pending = [n for n in range(1, checkpoint.last_page + 1) if n not in checkpoint.pages]
-            if not pending:
+        batch = _next_batch(checkpoint, job.workers)
+        if not batch:
+            if checkpoint.last_page is not None:
                 return True, ""
-            batch = pending[: job.workers]
-        else:
-            first = 1
-            while first in checkpoint.pages:
-                first += 1
-            if first > SAFETY_PAGE_LIMIT:
-                return False, "reached the safety page limit"
-            batch = list(range(first, first + job.workers))
+            return False, "reached the safety page limit"
 
         began = time.monotonic()
-        log(f"Fetching pages {batch[0]}-{batch[-1]}...", "step")
+        log(f"Fetching pages {', '.join(map(str, batch))}...", "step")
         results = _fetch_batch(job, batch)
         if job.verbose:
             log(f"Batch finished in {time.monotonic() - began:.1f}s", "dim")
@@ -535,23 +698,32 @@ def crawl(job, checkpoint):
         # Process results in page order, so the end of the listing is found correctly.
         for number, result in zip(batch, results):
             if result.kind == "fail":
-                return False, f"page {number} failed ({result.reason}), run again to resume"
+                return False, _failure_message(job, number, result.reason)
 
             ends_listing = result.kind in END_REASONS or (
                 result.kind == "ok" and _already_seen(checkpoint, result.videos)
             )
             if ends_listing:
-                # A checkpoint already knows where the listing ends. If that changed, do not shrink
-                # the listing silently, because that would drop videos from the output.
+                # A resumed checkpoint already knows where the listing ends. If the site now disagrees,
+                # stop instead of shrinking the listing silently, because that would drop videos.
                 if checkpoint.last_page is not None:
-                    return False, f"page {number} no longer matches the checkpoint, run with -n to start over"
+                    return False, (
+                        f"page {number} no longer matches the resumed checkpoint, "
+                        "start a new run without -R"
+                    )
                 # An empty first page is never trusted as a finished listing. It usually means a wrong
                 # username or a changed page layout.
                 if number == 1:
                     return False, "page 1 has no videos or does not exist, check the username or the page layout"
+                end_page = number - 1
+                if _later_pages_stored(checkpoint, end_page):
+                    return False, (
+                        f"page {number} ends the listing, but later pages are already stored. "
+                        "The listing changed, so start a new run without -R"
+                    )
                 reason = END_REASONS.get(result.kind, "repeats earlier pages")
-                checkpoint.set_last_page(number - 1)
-                log(f"Page {number} {reason}, last page is {number - 1}.", "success")
+                checkpoint.set_last_page(end_page)
+                log(f"Page {number} {reason}, last page is {end_page}.", "success")
                 break
 
             checkpoint.record(number, result.videos)
@@ -562,36 +734,95 @@ def crawl(job, checkpoint):
 # Output writers
 # ---------------------------------------------------------------------------
 
-def _md_text(value):
-    # Make text safe for a Markdown table cell.
-    return _clean(value).translate(_MD_SPECIAL)
+def _plain_value(value):
+    # Text for the plain text format. Empty values show a dash.
+    if value is None or value == "":
+        return "-"
+    return _clean(value)
 
 
-def _csv_safe(value):
-    # Stop spreadsheet programs from running a title as a formula.
-    return "'" + value if value.startswith(_CSV_TRIGGERS) else value
+def _write_txt(path, records, fieldnames, metadata, images=None):
+    # Plain text: one block per video, so it reads well in any editor and needs no viewer.
+    lines = [
+        "Eporner Video Listing",
+        "",
+        f"Source: {metadata['source_url']}",
+        f"Total videos: {metadata['total_videos']}",
+        f"Scraped at: {metadata['scraped_at']}",
+        f"Author: {metadata['author']}",
+        f"Homepage: {metadata['homepage']}",
+        "",
+    ]
+    for index, record in enumerate(records, start=1):
+        # The first line of each block is the title, or the URL when the title is not included.
+        if "title" in fieldnames:
+            heading = _clean(record["title"]) or "(no title)"
+            rest = [name for name in fieldnames if name != "title"]
+        else:
+            heading = _clean(record["url"])
+            rest = [name for name in fieldnames if name != "url"]
+        lines.append(f"{index}. {heading}")
+        lines.extend(f"   {FIELD_LABELS[name]}: {_plain_value(record[name])}" for name in rest)
+        lines.append("")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _write_csv(path, records, fieldnames, metadata):
+def _csv_value(value):
+    # Stop spreadsheet programs from running a title as a formula. Empty values become empty cells.
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return "'" + value if value.startswith(_CSV_TRIGGERS) else value
+    return value
+
+
+def _write_csv(path, records, fieldnames, metadata, images=None):
     # CSV has no room for metadata without breaking the table, so only records are written.
     # utf-8-sig adds a BOM so Excel reads non-Latin characters correctly.
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for record in records:
-            writer.writerow({key: _csv_safe(value) for key, value in record.items()})
+            writer.writerow({key: _csv_value(value) for key, value in record.items()})
 
 
-def _write_json(path, records, fieldnames, metadata):
+def _write_json(path, records, fieldnames, metadata, images=None):
     # Metadata (including author and homepage) and records together in one JSON object.
     payload = {**metadata, "records": records}
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _write_md(path, records, fieldnames, metadata):
-    # Markdown table. URLs are percent-encoded and wrapped in <> so they become clickable links.
+def _md_text(value):
+    # Make text safe for a Markdown table cell.
+    return _clean(value).translate(_MD_SPECIAL)
+
+
+def _md_thumbnail(url):
+    # A picture in a Markdown table. The width keeps the table readable.
+    if not url:
+        return "-"
+    src = html_escape(quote(url, safe=URL_SAFE_CHARS), quote=True)
+    return f'<img src="{src}" width="160" alt="">'
+
+
+def _md_cell(name, value):
+    # One Markdown table cell for one field.
+    if name == "thumbnail":
+        return _md_thumbnail(value)
+    if name == "views":
+        return "" if value is None else str(value)
+    if value is None or value == "":
+        return ""
+    if name == "url":
+        # Encoding removes spaces and <> so the link stays valid and the pipe cannot break the table.
+        return "<" + quote(_clean(value), safe=URL_SAFE_CHARS) + ">"
+    return _md_text(value)
+
+
+def _write_md(path, records, fieldnames, metadata, images=None):
+    # Markdown table with pictures for thumbnails and clickable URLs.
     headers = ["No", *(FIELD_LABELS[name] for name in fieldnames)]
-    alignment = [":--:", *([":--"] * len(fieldnames))]
+    alignment = [":--:", *("--:" if name == "views" else ":--" for name in fieldnames)]
     lines = [
         "# Eporner Video Listing",
         "",
@@ -605,25 +836,77 @@ def _write_md(path, records, fieldnames, metadata):
         "| " + " | ".join(alignment) + " |",
     ]
     for index, record in enumerate(records, start=1):
-        cells = [str(index)]
-        for name in fieldnames:
-            if name == "url":
-                # Encoding removes spaces and <> so the link stays valid and the pipe cannot break the table.
-                url = quote(_clean(record[name]), safe=URL_SAFE_CHARS)
-                cells.append(f"<{url}>")
-            else:
-                cells.append(_md_text(record[name]))
+        cells = [str(index), *(_md_cell(name, record[name]) for name in fieldnames)]
         lines.append("| " + " | ".join(cells) + " |")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _write_pdf(path, records, fieldnames, metadata):
+def _html_cell(name, value):
+    # One HTML table cell. Thumbnails are pictures, URLs are links, and all text is escaped.
+    if name == "thumbnail":
+        if not value:
+            return "-"
+        src = html_escape(value, quote=True)
+        return f'<img src="{src}" alt="" loading="lazy" referrerpolicy="no-referrer">'
+    if value is None or value == "":
+        return ""
+    if name == "url":
+        href = html_escape(value, quote=True)
+        return f'<a href="{href}" target="_blank" rel="noopener noreferrer">{html_escape(value)}</a>'
+    return html_escape(_clean(value))
+
+
+def _write_html(path, records, fieldnames, metadata, images=None):
+    # A single HTML file with inline styling. It follows the reader's light or dark setting.
+    head = '<th class="num">No</th>' + "".join(
+        f'<th class="{_HTML_CLASS[name]}">{html_escape(FIELD_LABELS[name])}</th>' for name in fieldnames
+    )
+    rows = []
+    for index, record in enumerate(records, start=1):
+        cells = [f'<td class="num">{index}</td>']
+        cells.extend(
+            f'<td class="{_HTML_CLASS[name]}">{_html_cell(name, record[name])}</td>' for name in fieldnames
+        )
+        rows.append("<tr>" + "".join(cells) + "</tr>")
+    homepage = html_escape(metadata["homepage"], quote=True)
+    page = "\n".join([
+        "<!DOCTYPE html>",
+        '<html lang="en">',
+        "<head>",
+        '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        "<title>Eporner Video Listing</title>",
+        f"<style>{_HTML_STYLE}</style>",
+        "</head>",
+        "<body>",
+        "<h1>Eporner Video Listing</h1>",
+        f'<p class="meta">Source: {html_escape(metadata["source_url"])} &middot; '
+        f'Total videos: {metadata["total_videos"]} &middot; '
+        f'Scraped at: {html_escape(metadata["scraped_at"])}</p>',
+        '<div class="table-wrap"><table>',
+        f"<thead><tr>{head}</tr></thead>",
+        "<tbody>",
+        *rows,
+        "</tbody>",
+        "</table></div>",
+        f'<footer>Author: {html_escape(metadata["author"])} &middot; '
+        f'<a href="{homepage}" rel="noopener noreferrer">{html_escape(metadata["homepage"])}</a></footer>',
+        "</body>",
+        "</html>",
+    ])
+    path.write_text(page + "\n", encoding="utf-8")
+
+
+def _write_pdf(path, records, fieldnames, metadata, images=None):
     # reportlab is imported here so it is only needed when PDF output is used.
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_RIGHT
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from reportlab.lib.utils import ImageReader
+    from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    images = images or {}
 
     # Colors
     navy = colors.HexColor("#1F2A44")
@@ -632,14 +915,19 @@ def _write_pdf(path, records, fieldnames, metadata):
     rule = colors.HexColor("#C9D3E3")
     muted = colors.HexColor("#5B6577")
 
-    # Page layout: landscape A4, with the number column fixed and the text columns sharing the rest.
+    # Page layout: landscape A4. Thumbnail and views have fixed widths, title and URL share the rest.
     page_size = landscape(A4)
     margin = 28
-    usable = page_size[0] - 2 * margin
     number_width = 40
-    text_width = usable - number_width
-    shares = [0.45, 0.55] if len(fieldnames) == 2 else [1.0]
-    widths = [number_width, *(text_width * share for share in shares)]
+    text_width = page_size[0] - 2 * margin - number_width
+    fixed_total = sum(PDF_FIXED_WIDTHS[name] for name in fieldnames if name in PDF_FIXED_WIDTHS)
+    flex_total = sum(PDF_FLEX_WEIGHTS[name] for name in fieldnames if name in PDF_FLEX_WEIGHTS)
+    widths = [number_width]
+    for name in fieldnames:
+        if name in PDF_FIXED_WIDTHS:
+            widths.append(PDF_FIXED_WIDTHS[name])
+        else:
+            widths.append((text_width - fixed_total) * PDF_FLEX_WEIGHTS[name] / flex_total)
 
     # Text styles
     base = getSampleStyleSheet()["BodyText"]
@@ -653,7 +941,24 @@ def _write_pdf(path, records, fieldnames, metadata):
     cell_style = ParagraphStyle("cell", parent=base, fontSize=7.5, leading=9.5, textColor=colors.black)
     # URLs have no spaces, so they wrap by character to stay inside their column.
     link_style = ParagraphStyle("link", parent=cell_style, textColor=accent, wordWrap="CJK")
+    views_style = ParagraphStyle("views", parent=cell_style, alignment=TA_RIGHT)
     index_style = ParagraphStyle("index", parent=cell_style, textColor=muted, alignment=TA_RIGHT)
+    placeholder_style = ParagraphStyle("placeholder", parent=cell_style, textColor=muted)
+    field_styles = {"title": cell_style, "url": link_style, "views": views_style}
+
+    def thumbnail_cell(url):
+        # Fit the downloaded picture inside the thumbnail box. Missing or unreadable pictures show a dash.
+        data = images.get(url) if url else None
+        if data is None:
+            return Paragraph("-", placeholder_style)
+        try:
+            width, height = ImageReader(io.BytesIO(data)).getSize()
+        except Exception:
+            return Paragraph("-", placeholder_style)
+        if not width or not height:
+            return Paragraph("-", placeholder_style)
+        scale = min(THUMB_BOX[0] / width, THUMB_BOX[1] / height)
+        return Image(io.BytesIO(data), width=width * scale, height=height * scale)
 
     # Build the table rows. The header row is first.
     headers = ["No", *(FIELD_LABELS[name] for name in fieldnames)]
@@ -661,8 +966,12 @@ def _write_pdf(path, records, fieldnames, metadata):
     for index, record in enumerate(records, start=1):
         row = [Paragraph(str(index), index_style)]
         for name in fieldnames:
-            style = link_style if name == "url" else cell_style
-            row.append(Paragraph(escape(_clean(record[name])), style))
+            value = record[name]
+            if name == "thumbnail":
+                row.append(thumbnail_cell(value))
+            else:
+                text = "" if value is None else _clean(value)
+                row.append(Paragraph(escape(text), field_styles[name]))
         rows.append(row)
 
     # Table styling: navy header, striped rows, thin grid.
@@ -724,15 +1033,22 @@ def _write_pdf(path, records, fieldnames, metadata):
     document.build(story, onFirstPage=draw_footer, onLaterPages=draw_footer)
 
 
-# Map each format name to its writer function.
-WRITERS = {"csv": _write_csv, "json": _write_json, "md": _write_md, "pdf": _write_pdf}
+# Map each format name to its writer function. Every writer takes the same arguments.
+WRITERS = {
+    "txt": _write_txt,
+    "csv": _write_csv,
+    "json": _write_json,
+    "md": _write_md,
+    "html": _write_html,
+    "pdf": _write_pdf,
+}
 
 
-def save_records(path, fmt, records, fieldnames, metadata):
+def save_records(path, fmt, records, fieldnames, metadata, images):
     # Write to a .tmp file first, then rename it. If writing fails, delete the .tmp file.
     tmp = path.with_name(path.name + ".tmp")
     try:
-        WRITERS[fmt](tmp, records, fieldnames, metadata)
+        WRITERS[fmt](tmp, records, fieldnames, metadata, images)
         tmp.replace(path)
     except BaseException:
         tmp.unlink(missing_ok=True)
@@ -741,7 +1057,11 @@ def save_records(path, fmt, records, fieldnames, metadata):
 
 def resolve_output(raw, fmt):
     # Expand "~", then add the format extension if the user did not type it.
-    path = Path(raw).expanduser()
+    # A folder name is refused, so a folder is never mistaken for a file name.
+    text = raw.strip()
+    if text.endswith(("/", "\\")) or text in ("~", ".", ".."):
+        raise ValueError("output must be a file name, not a folder")
+    path = Path(text).expanduser()
     if not path.name or path.name in (".", ".."):
         raise ValueError("output must be a file name, not a folder")
     if path.suffix.lower() == f".{fmt}":
@@ -758,21 +1078,25 @@ def _pdf_ready():
     return True
 
 
+def _check_folder_writable(folder):
+    # Create the folder if needed and confirm that a file can be written in it.
+    probe = folder / ".write_probe"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        probe.write_text("", encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"folder is not writable: {folder} ({exc})") from exc
+    finally:
+        probe.unlink(missing_ok=True)
+
+
 def ensure_output_ready(path, fmt):
     # Check the output path and dependencies before scraping starts.
     if path.is_dir():
         raise ValueError(f"output path is a folder: {path}")
     if fmt == "pdf" and not _pdf_ready():
         raise ValueError("format pdf needs reportlab, install it with: pip install reportlab")
-    folder = path.parent
-    probe = folder / ".write_probe"
-    try:
-        folder.mkdir(parents=True, exist_ok=True)
-        probe.write_text("", encoding="utf-8")
-    except OSError as exc:
-        raise ValueError(f"output folder is not writable: {folder} ({exc})") from exc
-    finally:
-        probe.unlink(missing_ok=True)
+    _check_folder_writable(path.parent)
 
 
 # ---------------------------------------------------------------------------
@@ -781,16 +1105,15 @@ def ensure_output_ready(path, fmt):
 
 @dataclass(frozen=True)
 class Job:
-    # All settings for one run, after parsing CLI or interactive input.
+    # All settings for one run, taken from the command line.
     url: str
     output: Path | None
     fmt: str
     fields: str
     workers: int
     attempts: int  # Tries per page before it is reported as failed.
-    checkpoint_path: Path
-    keep_checkpoint: bool
-    fresh: bool  # True means delete the old checkpoint first.
+    save_path: Path | None  # Where progress is written, or None for no checkpoint file.
+    resume_path: Path | None  # Where progress is read from, or None to start from the beginning.
     verbose: bool
 
 
@@ -806,8 +1129,8 @@ class Outcome:
 
 
 def fieldnames_for(fields):
-    # "url" gives only the URL column. "all" gives title and URL.
-    return ["url"] if fields == "url" else ["title", "url"]
+    # "url" gives only the URL column. "all" gives title, thumbnail, views, and URL, in that order.
+    return ["url"] if fields == "url" else list(ALL_FIELDS)
 
 
 def _shape(videos, fields):
@@ -821,15 +1144,13 @@ def _shape(videos, fields):
 # ---------------------------------------------------------------------------
 
 def run(job):
-    # Load checkpoint, crawl, save output, and decide what to keep.
+    # Load progress if asked to, crawl, save output, and report what was kept.
     started = time.monotonic()
-    checkpoint = Checkpoint(job.checkpoint_path, job.url)
-    if job.fresh:
-        checkpoint.discard()
-    else:
-        checkpoint.load()
+    checkpoint = Checkpoint(job.save_path, job.url)
+    if job.resume_path is not None:
+        checkpoint.load(job.resume_path)
         if checkpoint.covers_listing():
-            log("Checkpoint already covers the whole listing. Use -n to fetch it again.", "info")
+            log("The resumed checkpoint already covers the whole listing.", "info")
 
     complete, error = crawl(job, checkpoint)
     if error:
@@ -859,21 +1180,23 @@ def run(job):
             "author": AUTHOR,
             "homepage": HOMEPAGE,
         }
+        # Only the PDF embeds pictures, so only the PDF downloads them.
+        images = {}
+        if job.fmt == "pdf" and "thumbnail" in fieldnames:
+            images = _download_thumbnails(job, records)
         log(f"Saving {len(records)} records to {job.output} ({job.fmt})...", "step")
-        save_records(job.output, job.fmt, records, fieldnames, metadata)
+        save_records(job.output, job.fmt, records, fieldnames, metadata, images)
         log(f"Saved to {job.output}", "success")
         saved = True
 
-    # The checkpoint is only deleted when the run is complete AND the results are in a file.
-    # Otherwise it is the only copy of the data, so it stays.
+    # Checkpoint files are never deleted automatically. They stay until the user removes them.
     if not complete:
-        log("Results are incomplete. Checkpoint kept, run again to continue.", "warn")
-    elif not saved:
-        log("Checkpoint kept, because the results are not saved to a file yet.", "info")
-    elif job.keep_checkpoint:
-        log("Checkpoint kept (-k).", "info")
-    else:
-        checkpoint.discard()
+        if job.save_path is not None:
+            log(f"Results are incomplete. Progress kept in {job.save_path}, run with -R {job.save_path} to continue.", "warn")
+        else:
+            log("Results are incomplete and no checkpoint was saved. Use -s FILE next time to keep progress.", "warn")
+    elif job.save_path is not None:
+        log(f"Checkpoint kept at {job.save_path}.", "info")
 
     return Outcome(
         records=records,
@@ -913,215 +1236,96 @@ def parse_args(argv=None):
         allow_abbrev=False,  # Reject shortened long options like --keep.
     )
     parser.add_argument(
-        "-i", "--interactive", action="store_true",
-        help="run in interactive mode, all settings are asked step by step",
+        "-u", "--url", required=True,
+        help="Eporner profile URL or username",
     )
-
-    # All options below only work in CLI mode.
-    cli = parser.add_argument_group("CLI options (cannot be combined with -i)")
-    cli.add_argument("-u", "--url", help="Eporner profile URL or username")
-    cli.add_argument("-o", "--output", help="output file path, nothing is saved if omitted")
-    cli.add_argument(
-        "-f", "--format", choices=FORMATS,
+    parser.add_argument(
+        "-o", "--output",
+        help="output file path, nothing is saved if omitted",
+    )
+    parser.add_argument(
+        "-f", "--format", choices=FORMATS, default=DEFAULT_FORMAT,
         help=f"output format: {', '.join(FORMATS)} (default: {DEFAULT_FORMAT})",
     )
-    cli.add_argument(
-        "-F", "--fields", choices=FIELD_CHOICES,
-        help=f"all = title and url, url = url only (default: {DEFAULT_FIELDS})",
+    parser.add_argument(
+        "-F", "--fields", choices=FIELD_CHOICES, default=DEFAULT_FIELDS,
+        help=f"all = title, thumbnail, views, url; url = url only (default: {DEFAULT_FIELDS})",
     )
-    cli.add_argument(
-        "-w", "--workers", type=_bounded(1, MAX_WORKERS),
+    parser.add_argument(
+        "-w", "--workers", type=_bounded(1, MAX_WORKERS), default=DEFAULT_WORKERS,
         help=f"parallel requests, 1-{MAX_WORKERS} (default: {DEFAULT_WORKERS})",
     )
-    cli.add_argument(
-        "-r", "--retries", type=_bounded(1, MAX_RETRIES),
+    parser.add_argument(
+        "-r", "--retries", type=_bounded(1, MAX_RETRIES), default=DEFAULT_RETRIES,
         help=f"attempts per page, 1-{MAX_RETRIES} (default: {DEFAULT_RETRIES})",
     )
-    cli.add_argument(
-        "-c", "--checkpoint",
-        help="checkpoint file path (default: .scraper_checkpoint_<username>.json)",
+    parser.add_argument(
+        "-s", "--save-checkpoint", metavar="FILE",
+        help="save progress to FILE after every page, so the run can be continued with -R",
     )
-    cli.add_argument(
-        "-n", "--no-resume", action="store_true",
-        help="ignore and delete the checkpoint file at the checkpoint path, start from scratch",
+    parser.add_argument(
+        "-R", "--resume", metavar="FILE",
+        help="continue an earlier run from FILE, a checkpoint made with -s",
     )
-    cli.add_argument(
-        "-k", "--keep-checkpoint", action="store_true",
-        help="keep the checkpoint file after a complete run",
-    )
-    cli.add_argument(
+    parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="show the time taken for each batch of pages",
     )
 
     args = parser.parse_args(argv)
 
-    # Map each CLI flag to its value so we can detect flags used together with -i.
-    cli_values = {
-        "-u": args.url,
-        "-o": args.output,
-        "-f": args.format,
-        "-F": args.fields,
-        "-w": args.workers,
-        "-r": args.retries,
-        "-c": args.checkpoint,
-        "-n": args.no_resume,
-        "-k": args.keep_checkpoint,
-        "-v": args.verbose,
-    }
-
-    if args.interactive:
-        used = [flag for flag, value in cli_values.items() if value not in (None, False)]
-        if used:
-            parser.error(f"-i cannot be combined with {', '.join(used)}, interactive mode asks for them")
-        return args
-
-    if not args.url:
-        parser.error("-u/--url is required unless -i is used")
     if normalize_profile_url(args.url) is None:
         parser.error("-u/--url must be an Eporner profile URL or a username")
-    if args.output is not None and not args.output.strip():
-        parser.error("-o/--output must not be empty")
-
-    # Fill in defaults for anything the user did not set.
-    args.format = args.format or DEFAULT_FORMAT
-    args.fields = args.fields or DEFAULT_FIELDS
-    args.workers = args.workers or DEFAULT_WORKERS
-    args.retries = args.retries or DEFAULT_RETRIES
+    for flag, value in (("-o/--output", args.output),
+                        ("-s/--save-checkpoint", args.save_checkpoint),
+                        ("-R/--resume", args.resume)):
+        if value is not None and not value.strip():
+            parser.error(f"{flag} must not be empty")
     return args
 
 
-def make_job(url, fmt, fields, output, workers, attempts, checkpoint, keep_checkpoint, fresh, verbose):
-    # Build a Job from plain values. Used by both CLI and interactive mode.
-    return Job(
-        url=url,
-        output=resolve_output(output, fmt) if output else None,
-        fmt=fmt,
-        fields=fields,
-        workers=workers,
-        attempts=attempts,
-        checkpoint_path=Path(checkpoint),
-        keep_checkpoint=keep_checkpoint,
-        fresh=fresh,
-        verbose=verbose,
-    )
+def _path_or_none(text):
+    # Turn an optional path from the command line into a Path, or None when it was not given.
+    return Path(text).expanduser() if text else None
+
+
+def _same_file(a, b):
+    # True only when both paths are set and point to the same file.
+    return a is not None and b is not None and a.resolve() == b.resolve()
 
 
 def job_from_args(args):
-    # Convert parsed CLI arguments into a Job.
+    # Convert parsed CLI arguments into a Job, and refuse combinations that could lose data.
+    save_path = _path_or_none(args.save_checkpoint)
+    resume_path = _path_or_none(args.resume)
+    output = resolve_output(args.output, args.format) if args.output else None
+
+    if save_path is not None:
+        if save_path.is_dir():
+            raise ValueError(f"checkpoint path is a folder: {save_path}")
+        # Saving must never overwrite an older checkpoint, unless that is the file being resumed.
+        if save_path.exists() and not _same_file(save_path, resume_path):
+            raise ValueError(
+                f"{save_path} already exists. Use -R {save_path} to continue it, "
+                "or choose another name for -s."
+            )
+        _check_folder_writable(save_path.parent)
+
+    # The output file would replace the checkpoint, and the next resume would then fail.
+    if output is not None and (_same_file(output, save_path) or _same_file(output, resume_path)):
+        raise ValueError("the output file cannot be the same as the checkpoint file")
+
     url = normalize_profile_url(args.url)
-    return make_job(
+    return Job(
         url=url,
+        output=output,
         fmt=args.format,
         fields=args.fields,
-        output=args.output,
         workers=args.workers,
         attempts=args.retries,
-        checkpoint=args.checkpoint or checkpoint_name(url),
-        keep_checkpoint=args.keep_checkpoint,
-        fresh=args.no_resume,
+        save_path=save_path,
+        resume_path=resume_path,
         verbose=args.verbose,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Interactive mode
-# ---------------------------------------------------------------------------
-
-def _ask(prompt, default=""):
-    # Ask one question. Press Enter to accept the default.
-    suffix = f" {Fore.WHITE}[{default}]{Style.RESET_ALL}" if default else ""
-    return input(f"{Fore.CYAN}?{Style.RESET_ALL} {prompt}{suffix}: ").strip() or default
-
-
-def _ask_choice(prompt, choices, default):
-    # Ask until the answer is one of the allowed choices.
-    options = "/".join(choices)
-    while True:
-        answer = _ask(f"{prompt} ({options})", default).lower()
-        if answer in choices:
-            return answer
-        print(f"{Fore.YELLOW}Please choose one of: {options}{Style.RESET_ALL}")
-
-
-def _ask_int(prompt, default, low, high):
-    # Ask until the answer is an integer within range.
-    while True:
-        answer = _ask(f"{prompt} ({low}-{high})", str(default))
-        try:
-            value = int(answer)
-        except ValueError:
-            print(f"{Fore.YELLOW}Please enter a number.{Style.RESET_ALL}")
-            continue
-        if low <= value <= high:
-            return value
-        print(f"{Fore.YELLOW}Please enter a number between {low} and {high}.{Style.RESET_ALL}")
-
-
-def _ask_url():
-    # Ask until the input is a valid profile URL or username.
-    while True:
-        url = normalize_profile_url(_ask("Profile URL or username"))
-        if url is not None:
-            return url
-        print(f"{Fore.YELLOW}Enter an Eporner profile URL or a username.{Style.RESET_ALL}")
-
-
-def _ask_output():
-    # Ask for the output file. An empty answer means do not save. A folder name is refused.
-    while True:
-        raw = _ask("Output file (empty = do not save)")
-        if not raw:
-            return ""
-        if Path(raw).name not in ("", ".", ".."):
-            return raw
-        print(f"{Fore.YELLOW}Enter a file name, not a folder.{Style.RESET_ALL}")
-
-
-def _ask_format():
-    # Ask for the format. PDF is only accepted when reportlab is installed.
-    while True:
-        fmt = _ask_choice("Format", FORMATS, DEFAULT_FORMAT)
-        if fmt != "pdf" or _pdf_ready():
-            return fmt
-        print(f"{Fore.YELLOW}PDF needs reportlab. Install it with: pip install reportlab{Style.RESET_ALL}")
-
-
-def interactive_job():
-    # Ask for settings in order. Checkpoint questions only appear when they apply.
-    print(f"{Fore.CYAN}{Style.BRIGHT}Interactive mode{Style.RESET_ALL}")
-    url = _ask_url()
-    checkpoint_path = Path(checkpoint_name(url))
-
-    fresh = False
-    if checkpoint_path.exists():
-        choice = _ask_choice(
-            f"Checkpoint found ({checkpoint_path.name}). Resume or start over?",
-            ("resume", "fresh"),
-            "resume",
-        )
-        fresh = choice == "fresh"
-
-    output = _ask_output()
-    fmt, fields, keep = DEFAULT_FORMAT, DEFAULT_FIELDS, False
-    if output:
-        fmt = _ask_format()
-        fields = _ask_choice("Fields", FIELD_CHOICES, DEFAULT_FIELDS)
-        keep = _ask_choice("Keep checkpoint after a complete run?", ("no", "yes"), "no") == "yes"
-
-    workers = _ask_int("Workers", DEFAULT_WORKERS, 1, MAX_WORKERS)
-    attempts = _ask_int("Attempts per page", DEFAULT_RETRIES, 1, MAX_RETRIES)
-    return make_job(
-        url=url,
-        fmt=fmt,
-        fields=fields,
-        output=output or None,
-        workers=workers,
-        attempts=attempts,
-        checkpoint=str(checkpoint_path),
-        keep_checkpoint=keep,
-        fresh=fresh,
-        verbose=False,
     )
 
 
@@ -1143,13 +1347,14 @@ def print_summary(outcome, job):
     else:
         saved = "not saved (use -o)"
     print()
-    print(f"Source  : {job.url}")
-    print(f"Records : {len(outcome.records)}")
-    print(f"Output  : {saved}")
-    print(f"Format  : {outcome.fmt if outcome.output else '-'}")
-    print(f"Fields  : {', '.join(outcome.fieldnames)}")
-    print(f"Elapsed : {outcome.elapsed:.1f}s")
-    print(f"Status  : {status}")
+    print(f"Source     : {job.url}")
+    print(f"Records    : {len(outcome.records)}")
+    print(f"Output     : {saved}")
+    print(f"Format     : {outcome.fmt if outcome.output else '-'}")
+    print(f"Fields     : {', '.join(outcome.fieldnames)}")
+    print(f"Checkpoint : {job.save_path if job.save_path else 'none'}")
+    print(f"Elapsed    : {outcome.elapsed:.1f}s")
+    print(f"Status     : {status}")
 
 
 # ---------------------------------------------------------------------------
@@ -1166,18 +1371,17 @@ def main(argv=None):
 
     args = parse_args(argv)
     try:
-        job = interactive_job() if args.interactive else job_from_args(args)
+        job = job_from_args(args)
         if job.output is not None:
             ensure_output_ready(job.output, job.fmt)
         outcome = run(job)
     except KeyboardInterrupt:
         print(flush=True)
-        log("Stopped by user. Run again to resume.", "warn")
+        if args.save_checkpoint:
+            log("Stopped by user. Progress saved with -s is kept, run with -R to continue.", "warn")
+        else:
+            log("Stopped by user. Nothing was saved, use -s FILE next time to keep progress.", "warn")
         return 130
-    except EOFError:
-        print(flush=True)
-        log("Input ended before setup was complete.", "error")
-        return 2
     except ValueError as exc:
         log(f"Validation error: {exc}", "error")
         return 2
