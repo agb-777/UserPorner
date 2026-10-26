@@ -40,8 +40,10 @@ FORMATS = ("csv", "json", "md", "pdf")
 FIELD_CHOICES = ("all", "url")
 FIELD_LABELS = {"title": "Title", "url": "URL"}
 
-# Matches a profile URL and captures the username.
-PROFILE_PATTERN = re.compile(r"https?://(?:www\.)?eporner\.com/profile/([^/?#]+)", re.IGNORECASE)
+# Accepts a full profile URL, with or without scheme and www, and captures the username.
+PROFILE_PATTERN = re.compile(r"(?:https?://)?(?:www\.)?eporner\.com/profile/([^/?#]+)", re.IGNORECASE)
+# A bare username: letters, digits, underscore, dot, and dash only.
+USERNAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]+")
 # Matches a listing page number such as /uploaded-videos/3/.
 PAGE_PATTERN = re.compile(r"/uploaded-videos/(\d+)(?:[/?#]|$)")
 # Every video link contains this text.
@@ -99,11 +101,16 @@ def log(message, level="info"):
 # ---------------------------------------------------------------------------
 
 def normalize_profile_url(raw):
-    # Turn any profile URL into the full /uploaded-videos/ listing URL. Return None if invalid.
-    match = PROFILE_PATTERN.search(raw or "")
-    if match is None:
+    # Accept a full profile URL or a bare username. Return the listing URL, or None if invalid.
+    text = (raw or "").strip()
+    match = PROFILE_PATTERN.search(text)
+    if match is not None:
+        username = match.group(1)
+    elif USERNAME_PATTERN.fullmatch(text):
+        username = text
+    else:
         return None
-    return f"https://www.eporner.com/profile/{match.group(1)}/uploaded-videos/"
+    return f"https://www.eporner.com/profile/{username}/uploaded-videos/"
 
 
 def page_url(base, number):
@@ -748,12 +755,15 @@ def run(job):
 
     if not records:
         log("No videos were extracted. Check the URL, network, or site structure.", "warn")
+
+    # The checkpoint is removed after a complete run, unless -k asks to keep it.
+    # An incomplete run always keeps it, so the next run can continue.
     if not complete:
         log("Results are incomplete. Checkpoint kept, run again to continue.", "warn")
-    elif saved and not job.keep_checkpoint:
+    elif job.keep_checkpoint:
+        log("Checkpoint kept (-k).", "info")
+    else:
         checkpoint.discard()
-    elif not saved:
-        log("Checkpoint kept so you can save later.", "info")
 
     return Outcome(
         records=records,
@@ -787,13 +797,6 @@ def parse_args(argv=None):
             "Scrape video listings from an Eporner profile.\n"
             f"author: {AUTHOR}  |  homepage: {HOMEPAGE}"
         ),
-        epilog=(
-            "examples:\n"
-            "  python userporner.py -u https://www.eporner.com/profile/NAME/ -o hasil -f md\n"
-            "  python userporner.py -u https://www.eporner.com/profile/NAME/ -o hasil -f pdf -F url -k\n"
-            "  python userporner.py -u https://www.eporner.com/profile/NAME/\n"
-            "  python userporner.py -i"
-        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         allow_abbrev=False,  # Reject shortened long options like --keep.
     )
@@ -804,7 +807,7 @@ def parse_args(argv=None):
 
     # All options below only work in CLI mode.
     cli = parser.add_argument_group("CLI options (cannot be combined with -i)")
-    cli.add_argument("-u", "--url", help="Eporner profile URL")
+    cli.add_argument("-u", "--url", help="Eporner profile URL or username")
     cli.add_argument("-o", "--output", help="output file path, nothing is saved if omitted")
     cli.add_argument(
         "-f", "--format", choices=FORMATS,
@@ -864,7 +867,7 @@ def parse_args(argv=None):
     if not args.url:
         parser.error("-u/--url is required unless -i is used")
     if normalize_profile_url(args.url) is None:
-        parser.error("-u/--url must be an eporner.com/profile/<username> URL")
+        parser.error("-u/--url must be an Eporner profile URL or a username")
 
     # Fill in defaults for anything the user did not set.
     args.format = args.format or DEFAULT_FORMAT
@@ -942,12 +945,12 @@ def _ask_int(prompt, default, low, high):
 
 
 def _ask_url():
-    # Ask until the URL is a valid Eporner profile URL.
+    # Ask until the input is a valid profile URL or username.
     while True:
-        url = normalize_profile_url(_ask("Profile URL (eporner.com/profile/<username>)"))
+        url = normalize_profile_url(_ask("Profile URL or username"))
         if url is not None:
             return url
-        print(f"{Fore.YELLOW}That is not a valid Eporner profile URL.{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}Enter an Eporner profile URL or a username.{Style.RESET_ALL}")
 
 
 def interactive_job():
@@ -995,12 +998,6 @@ def print_summary(outcome, job):
     print(f"Fields  : {', '.join(outcome.fieldnames)}")
     print(f"Elapsed : {outcome.elapsed:.1f}s")
     print(f"Status  : {status}")
-    print()
-    for record in outcome.records[:5]:
-        label = record.get("title") or record["url"]
-        print(f"  - {label[:60]}")
-    if len(outcome.records) > 5:
-        print(f"  ... and {len(outcome.records) - 5} more")
 
 
 # ---------------------------------------------------------------------------
