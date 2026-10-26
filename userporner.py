@@ -1,5 +1,5 @@
 # userporner.py
-# Scrape the video list of an Eporner profile into CSV, JSON, Markdown, or PDF.
+# Export the video list of an Eporner profile to CSV, JSON, Markdown, or PDF.
 # Author: agb-777
 # Homepage: https://github.com/agb-777/userporner
 
@@ -12,20 +12,17 @@ import re
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import suppress
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urljoin
 from xml.sax.saxutils import escape
 
 from colorama import Fore, Style, init
-from selenium import webdriver
-from selenium.common.exceptions import TimeoutException, WebDriverException
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -47,19 +44,15 @@ FIELD_LABELS = {"title": "Title", "url": "URL"}
 PROFILE_PATTERN = re.compile(r"https?://(?:www\.)?eporner\.com/profile/([^/?#]+)", re.IGNORECASE)
 # Matches a listing page number such as /uploaded-videos/3/.
 PAGE_PATTERN = re.compile(r"/uploaded-videos/(\d+)(?:[/?#]|$)")
-
-# CSS selectors used to read the page. If the site changes its layout, update these.
+# Every video link contains this text.
 VIDEO_MARKER = "/video-"
-VIDEO_SELECTOR = f'a[href*="{VIDEO_MARKER}"]'
-CONTAINER_SELECTOR = ".mb"
-UPLOADS_LINK_SELECTOR = 'a[href*="/uploaded-videos/"]'
-LAST_PAGE_SELECTOR = 'link[rel="last"]'
-NEXT_PAGE_SELECTOR = 'link[rel="next"]'
+# Text that appears in the markup of every real listing page, even when it has no videos.
+LISTING_MARKER = "/uploaded-videos/"
 
-# Timeouts and limits, in seconds unless noted.
-PAGE_LOAD_TIMEOUT = 30
-RENDER_TIMEOUT = 15
-RETRY_DELAY = 2
+# Network settings, in seconds unless noted.
+REQUEST_TIMEOUT = 20
+REQUEST_DELAY = 0.5  # Pause before each request, per worker, to keep the load on the site low.
+RETRY_DELAY = 2  # Multiplied by the attempt number, so retries back off.
 SAFETY_PAGE_LIMIT = 100_000  # Hard stop so the scraper cannot loop forever.
 MAX_WORKERS = 10
 MAX_RETRIES = 10
@@ -68,18 +61,11 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
-
-# Chrome flags. Headless mode runs without a window.
-CHROME_ARGUMENTS = (
-    "--headless=new",
-    "--no-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--window-size=1920,1080",
-    "--disable-blink-features=AutomationControlled",
-    "--log-level=3",
-    f"user-agent={USER_AGENT}",
-)
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -87,9 +73,6 @@ CHROME_ARGUMENTS = (
 
 # Lock so messages from several threads do not mix on one line.
 _LOG_LOCK = threading.Lock()
-# Lock so only one thread starts Chrome at a time. This avoids a race in
-# Selenium Manager's metadata file.
-_DRIVER_START_LOCK = threading.Lock()
 _LOG_STYLES = {
     "info": (Fore.CYAN, "*"),
     "success": (Fore.GREEN, "+"),
@@ -106,77 +89,6 @@ def log(message, level="info"):
     stamp = datetime.now().strftime("%H:%M:%S")
     with _LOG_LOCK:
         print(f"{color}{Style.DIM}[{stamp}]{Style.NORMAL} {symbol} {message}{Style.RESET_ALL}", flush=True)
-
-
-# ---------------------------------------------------------------------------
-# Browser management
-# ---------------------------------------------------------------------------
-
-def _build_options():
-    # Build Chrome options from CHROME_ARGUMENTS and hide the automation flags.
-    options = Options()
-    for argument in CHROME_ARGUMENTS:
-        options.add_argument(argument)
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-    return options
-
-
-def _quit_quietly(driver):
-    # Close a driver and ignore errors, because it may already be dead.
-    with suppress(Exception):
-        driver.quit()
-
-
-class DriverPool:
-    # Gives each worker thread its own Chrome driver and tracks them all for cleanup.
-
-    def __init__(self):
-        self._local = threading.local()  # One driver per thread.
-        self._drivers = []
-        self._lock = threading.Lock()
-        self._closed = False
-
-    @property
-    def closed(self):
-        return self._closed
-
-    def acquire(self):
-        # Return this thread's driver, creating it on first use.
-        if self._closed:
-            raise RuntimeError("driver pool is closed")
-        driver = getattr(self._local, "driver", None)
-        if driver is None:
-            driver = self._create()
-            self._local.driver = driver
-        return driver
-
-    def discard(self):
-        # Drop this thread's driver, for example after a crash, so the next call creates a new one.
-        driver = getattr(self._local, "driver", None)
-        self._local.driver = None
-        if driver is not None:
-            _quit_quietly(driver)
-            with self._lock:
-                if driver in self._drivers:
-                    self._drivers.remove(driver)
-
-    def close(self):
-        # Shut down every driver. Called once at the end of the program.
-        self._closed = True
-        with self._lock:
-            drivers, self._drivers = self._drivers, []
-        for driver in drivers:
-            _quit_quietly(driver)
-
-    def _create(self):
-        # Start a new Chrome driver. The global lock serializes startup.
-        with _DRIVER_START_LOCK:
-            driver = webdriver.Chrome(options=_build_options())
-        driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
-        with self._lock:
-            self._drivers.append(driver)
-        return driver
 
 
 # ---------------------------------------------------------------------------
@@ -203,157 +115,158 @@ def page_number(url):
 
 
 # ---------------------------------------------------------------------------
-# Page reading
+# HTML parsing
 # ---------------------------------------------------------------------------
 
-def _wait_for_videos(driver):
-    # Wait until at least one video link appears, or raise TimeoutException.
-    WebDriverWait(driver, RENDER_TIMEOUT).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, VIDEO_SELECTOR))
-    )
+def _clean(value):
+    # Collapse whitespace and newlines into single spaces.
+    return " ".join(str(value).split())
 
 
-def _is_empty(driver):
-    # A page is empty when it has neither video containers nor video links.
-    return not (
-        driver.find_elements(By.CSS_SELECTOR, CONTAINER_SELECTOR)
-        or driver.find_elements(By.CSS_SELECTOR, VIDEO_SELECTOR)
-    )
+def _urls(videos):
+    # The set of video URLs in a list of {title, url} dictionaries.
+    return {video["url"] for video in videos}
 
 
-def _title(anchor):
-    # Get the title from the link attribute first, then the image alt text, then the visible text.
-    title = (anchor.get_attribute("title") or "").strip()
-    if title:
-        return title
-    images = anchor.find_elements(By.TAG_NAME, "img")
-    alt = (images[0].get_attribute("alt") or "").strip() if images else ""
-    return alt or (anchor.text or "").strip()
+class _VideoParser(HTMLParser):
+    # Collects video links from one listing page.
+    # Each link is tagged with whether it sits inside a div with class "mb",
+    # which is the listing container the browser version used.
+
+    def __init__(self, base_url):
+        super().__init__(convert_charrefs=True)
+        self._base = base_url
+        self._div_stack = []  # One flag per open div: True if it is a listing container.
+        self._href = None  # Absolute URL of the video link we are inside, or None.
+        self._in_container = False
+        self._title = ""
+        self._alt = ""
+        self._text = []
+        self.videos = []  # (url, title, in_container) in page order.
+
+    def handle_starttag(self, tag, attrs):
+        attr = dict(attrs)
+        if tag == "div":
+            self._div_stack.append("mb" in (attr.get("class") or "").split())
+            return
+        if self._href is not None:
+            if tag == "img" and not self._alt:
+                self._alt = (attr.get("alt") or "").strip()
+            return
+        if tag != "a":
+            return
+        href = attr.get("href") or ""
+        if VIDEO_MARKER not in href:
+            return
+        # Relative links are resolved against the page URL, like a browser does.
+        self._href = urljoin(self._base, href)
+        self._in_container = any(self._div_stack)
+        self._title = (attr.get("title") or "").strip()
+        self._alt = ""
+        self._text = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "div":
+            if self._div_stack:
+                self._div_stack.pop()
+            return
+        if tag != "a" or self._href is None:
+            return
+        # Title order: title attribute, then image alt text, then visible text.
+        title = self._title or self._alt or _clean("".join(self._text))
+        self.videos.append((self._href, title, self._in_container))
+        self._href = None
 
 
-def _extract(driver):
-    # Collect unique {title, url} pairs from the page.
-    # Prefer links inside .mb containers. Fall back to all video links if there are none.
-    anchors = []
-    for container in driver.find_elements(By.CSS_SELECTOR, CONTAINER_SELECTOR):
-        anchors.extend(container.find_elements(By.CSS_SELECTOR, VIDEO_SELECTOR))
-    if not anchors:
-        anchors = driver.find_elements(By.CSS_SELECTOR, VIDEO_SELECTOR)
-
+def parse_videos(html, page_url_value):
+    # Return a list of {title, url} dictionaries from one listing page.
+    parser = _VideoParser(page_url_value)
+    parser.feed(html)
+    parser.close()
+    # Prefer links inside listing containers. Fall back to every video link if the page has none.
+    chosen = [item for item in parser.videos if item[2]] or parser.videos
     found = {}
-    for anchor in anchors:
-        try:
-            url = anchor.get_attribute("href") or ""
-            title = _title(anchor)
-        except WebDriverException:
-            # The element went stale while reading. Skip it.
-            continue
-        if VIDEO_MARKER not in url:
-            continue
+    for url, title, _ in chosen:
+        known = found.get(url, "")
         # Keep the first non-empty title seen for each URL.
-        if url not in found or (title and not found[url]):
+        if url not in found or (title and not known):
             found[url] = title
     return [{"title": title, "url": url} for url, title in found.items()]
 
 
-def load_listing(driver, url):
-    # Load one listing page.
-    # Return a list of videos, an empty list for a real empty page, or None if the page failed to render.
-    driver.get(url)
-    # The site may redirect a missing page number back to another page. Treat that as empty.
-    if page_number(driver.current_url) != page_number(url):
-        return []
-    try:
-        _wait_for_videos(driver)
-    except TimeoutException:
-        return [] if _is_empty(driver) else None
-    return _extract(driver)
+# ---------------------------------------------------------------------------
+# Page fetching
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PageResult:
+    # kind is one of:
+    #   "ok"       the page has videos
+    #   "end"      the page is a real listing with no videos, confirmed over every retry
+    #   "missing"  the page does not exist (404) or redirected to another page
+    #   "fail"     the page could not be read after all retries
+    kind: str
+    videos: list | None = None
+    reason: str = ""
 
 
-def fetch_page(pool, url, retries):
-    # Try to load a page up to `retries` times. Return the videos, or None if every attempt failed.
+def _download(url):
+    # Download one page and return (final URL after redirects, decoded HTML).
+    request = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+        charset = response.headers.get_content_charset() or "utf-8"
+        html = response.read().decode(charset, errors="replace")
+        return response.geturl(), html
+
+
+def fetch_page(base, number, retries):
+    # Fetch one listing page with retries. Return a PageResult.
+    url = page_url(base, number)
     reason = "unknown"
     for attempt in range(1, retries + 1):
-        if pool.closed:
-            return None
+        time.sleep(REQUEST_DELAY)
         try:
-            videos = load_listing(pool.acquire(), url)
-            reason = "page did not render"
+            final_url, html = _download(url)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return PageResult("missing")
+            reason = f"HTTP {exc.code}"
         except Exception as exc:
-            # The driver may be broken, so throw it away and create a new one next time.
-            pool.discard()
-            videos = None
+            # Covers timeouts, connection resets, incomplete reads, and unknown charsets.
             reason = type(exc).__name__
-        if videos is not None:
-            return videos
-        if attempt < retries and not pool.closed:
+        else:
+            # A missing page number is often redirected to another page.
+            if page_number(final_url) != number:
+                return PageResult("missing")
+            videos = parse_videos(html, final_url)
+            if videos:
+                return PageResult("ok", videos)
+            if LISTING_MARKER in html:
+                # An empty listing only counts as the end if every attempt agrees.
+                reason = "empty listing"
+                if attempt == retries:
+                    return PageResult("end")
+            else:
+                # Anything else, such as a challenge or error page, is a failure, never the end.
+                reason = "unexpected page content"
+        if attempt < retries:
             log(f"Attempt {attempt}/{retries} failed ({reason}): {url}", "warn")
-            time.sleep(RETRY_DELAY)
+            time.sleep(RETRY_DELAY * attempt)
     log(f"All {retries} attempts failed: {url}", "error")
-    return None
+    return PageResult("fail", reason=reason)
 
 
-# ---------------------------------------------------------------------------
-# Last page detection
-# ---------------------------------------------------------------------------
-
-def _last_page_hint(driver):
-    # Look for the highest page number in the <link rel="last"> tag and in the pagination links.
-    candidate = 1
-    for link in driver.find_elements(By.CSS_SELECTOR, LAST_PAGE_SELECTOR):
-        candidate = max(candidate, page_number(link.get_attribute("href")))
-    for anchor in driver.find_elements(By.CSS_SELECTOR, UPLOADS_LINK_SELECTOR):
-        candidate = max(candidate, page_number(anchor.get_attribute("href")))
-    return candidate
-
-
-def _walk_next_links(driver, start_url):
-    # Last resort: follow rel="next" links one by one until there are none. This is slow.
-    last = 1
-    url = start_url
-    visited = set()  # Prevents loops.
-    while url and url not in visited and len(visited) < SAFETY_PAGE_LIMIT:
-        visited.add(url)
-        driver.get(url)
-        try:
-            _wait_for_videos(driver)
-        except TimeoutException:
-            break
-        last = max(last, page_number(driver.current_url))
-        next_links = driver.find_elements(By.CSS_SELECTOR, NEXT_PAGE_SELECTOR)
-        url = next_links[0].get_attribute("href") if next_links else None
-    return last
-
-
-def _detect_once(driver, start_url):
-    # Estimate the last page number from page 1.
-    driver.get(start_url)
+def _fetch_batch(job, batch):
+    # Fetch several pages at once. Results come back in the same order as the batch.
+    executor = ThreadPoolExecutor(max_workers=job.workers)
     try:
-        _wait_for_videos(driver)
-    except TimeoutException:
-        # An empty profile has only one page.
-        if _is_empty(driver):
-            return 1
-        raise
-
-    candidate = _last_page_hint(driver)
-    if candidate == 1:
-        log("No last-page marker found, walking rel=next links (this can be slow).", "warn")
-        candidate = _walk_next_links(driver, start_url)
-    return min(candidate, SAFETY_PAGE_LIMIT)
-
-
-def detect_last_page(pool, start_url, retries):
-    # Run the detection and retry on failure. Raise if the last attempt also fails.
-    for attempt in range(1, retries + 1):
-        try:
-            return _detect_once(pool.acquire(), start_url)
-        except Exception as exc:
-            pool.discard()
-            if attempt == retries:
-                raise
-            log(f"Last-page detection failed ({attempt}/{retries}): {type(exc).__name__}", "warn")
-            time.sleep(RETRY_DELAY)
+        return list(executor.map(lambda number: fetch_page(job.url, number, job.retries), batch))
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------
@@ -382,15 +295,22 @@ class Checkpoint:
         self.path = Path(path)
         self.source_url = source_url  # The checkpoint only applies to this URL.
         self.pages = {}  # {page number: [videos]}
+        self.last_page = None  # Set once the end of the listing is confirmed.
 
     @property
     def videos(self):
-        # All videos from all pages, with duplicates removed by URL.
+        # All videos from pages up to the last page, with duplicates removed by URL.
         unique = {}
         for number in sorted(self.pages):
+            if self.last_page is not None and number > self.last_page:
+                continue
             for video in self.pages[number]:
                 unique.setdefault(video["url"], video)
         return list(unique.values())
+
+    def covers_listing(self):
+        # True when the end is known and every page up to it is stored.
+        return self.last_page is not None and all(n in self.pages for n in range(1, self.last_page + 1))
 
     def load(self):
         # Read the checkpoint file. Ignore it if it is broken or belongs to a different URL.
@@ -404,19 +324,28 @@ class Checkpoint:
         if not isinstance(data, dict) or data.get("source_url") != self.source_url:
             log("Checkpoint belongs to another URL or is invalid, ignoring it.", "warn")
             return
+
+        last = data.get("last_page")
+        if isinstance(last, int) and not isinstance(last, bool) and 0 <= last <= SAFETY_PAGE_LIMIT:
+            self.last_page = last
+
         stored = data.get("pages")
-        if not isinstance(stored, dict):
-            return
-        # Keep only the valid pages and valid videos.
-        for key, videos in stored.items():
-            if _is_page_key(key) and isinstance(videos, list):
-                self.pages[int(key)] = [video for video in videos if _is_video(video)]
-        if self.pages:
+        if isinstance(stored, dict):
+            for key, videos in stored.items():
+                if _is_page_key(key) and isinstance(videos, list):
+                    self.pages[int(key)] = [video for video in videos if _is_video(video)]
+
+        if self.pages or self.last_page is not None:
             log(f"Resuming from checkpoint: {len(self.pages)} pages, {len(self.videos)} videos", "success")
 
     def record(self, number, videos):
         # Store one page and save the whole checkpoint.
         self.pages[number] = videos
+        self._save()
+
+    def set_last_page(self, number):
+        # Mark the end of the listing and save it.
+        self.last_page = number
         self._save()
 
     def discard(self):
@@ -428,6 +357,7 @@ class Checkpoint:
         payload = {
             "source_url": self.source_url,
             "timestamp": datetime.now().isoformat(),
+            "last_page": self.last_page,
             "pages": {str(number): videos for number, videos in sorted(self.pages.items())},
         }
         tmp = self.path.with_name(self.path.name + ".tmp")
@@ -439,13 +369,59 @@ class Checkpoint:
 
 
 # ---------------------------------------------------------------------------
-# Output writers
+# Crawling
 # ---------------------------------------------------------------------------
 
-def _clean(value):
-    # Collapse whitespace and newlines into single spaces.
-    return " ".join(str(value).split())
+def crawl(job, checkpoint):
+    # Fetch pages in parallel batches until the end of the listing is confirmed.
+    # Return (complete, error_message).
+    while True:
+        if checkpoint.last_page is not None:
+            missing = [n for n in range(1, checkpoint.last_page + 1) if n not in checkpoint.pages]
+            if not missing:
+                return True, ""
+            batch = missing[: job.workers]
+        else:
+            first = 1
+            while first in checkpoint.pages:
+                first += 1
+            if first > SAFETY_PAGE_LIMIT:
+                return False, "reached the safety page limit"
+            batch = list(range(first, first + job.workers))
 
+        began = time.monotonic()
+        log(f"Fetching pages {batch[0]}-{batch[-1]} with {job.workers} workers...", "step")
+        results = _fetch_batch(job, batch)
+        if job.verbose:
+            log(f"Batch finished in {time.monotonic() - began:.1f}s", "dim")
+
+        # Process results in page order, so the end of the listing is found correctly.
+        for number, result in zip(batch, results):
+            if result.kind == "fail":
+                return False, f"page {number} failed ({result.reason}), run again to resume"
+            if result.kind == "missing":
+                if number == 1:
+                    return False, "profile page not found or redirected, check the URL"
+                checkpoint.set_last_page(number - 1)
+                log(f"Page {number} does not exist, last page is {number - 1}.", "success")
+                break
+            if result.kind == "end":
+                checkpoint.set_last_page(number - 1)
+                log(f"Page {number} is empty, last page is {number - 1}.", "success")
+                break
+            previous = checkpoint.pages.get(number - 1)
+            if previous is not None and _urls(previous) == _urls(result.videos):
+                # Some sites repeat the last page for out-of-range numbers.
+                checkpoint.set_last_page(number - 1)
+                log(f"Page {number} repeats the previous page, last page is {number - 1}.", "success")
+                break
+            checkpoint.record(number, result.videos)
+            log(f"Page {number}: {len(result.videos)} videos", "success")
+
+
+# ---------------------------------------------------------------------------
+# Output writers
+# ---------------------------------------------------------------------------
 
 def _write_csv(path, records, fieldnames, metadata):
     # CSV has no room for metadata without breaking the table, so only records are written.
@@ -662,7 +638,7 @@ class Outcome:
     fmt: str
     fieldnames: list
     elapsed: float
-    complete: bool  # True only if every page was fetched and the end was verified.
+    complete: bool  # True only if the end of the listing was confirmed and every page was saved.
 
 
 def fieldnames_for(fields):
@@ -677,124 +653,24 @@ def _shape(videos, fields):
 
 
 # ---------------------------------------------------------------------------
-# Scraping flow
+# Main flow
 # ---------------------------------------------------------------------------
 
-def _record(checkpoint, page, videos):
-    # Save one page to the checkpoint and print progress.
-    checkpoint.record(page, videos)
-    log(f"Page {page}: {len(videos)} videos", "success")
-
-
-def _fetch_and_record(pool, job, checkpoint, page):
-    # Fetch one page in the current thread. Return True if it worked.
-    videos = fetch_page(pool, page_url(job.url, page), job.retries)
-    if videos is None:
-        return False
-    _record(checkpoint, page, videos)
-    return True
-
-
-def _fetch_pages(pool, job, checkpoint, pages):
-    # Fetch many pages in parallel. Return the list of pages that still failed afterward.
-    if not pages:
-        return []
-
-    log(f"Fetching {len(pages)} pages with {job.workers} workers...", "step")
-    failed = []
-    started = {}
-    executor = ThreadPoolExecutor(max_workers=job.workers)
-    try:
-        futures = {}
-        for page in pages:
-            started[page] = time.monotonic()
-            future = executor.submit(fetch_page, pool, page_url(job.url, page), job.retries)
-            futures[future] = page
-
-        # Handle each page as soon as it finishes, not in submission order.
-        for future in as_completed(futures):
-            page = futures[future]
-            try:
-                videos = future.result()
-            except Exception as exc:
-                log(f"Page {page} raised {type(exc).__name__}: {exc}", "error")
-                videos = None
-            if videos is None:
-                failed.append(page)
-            else:
-                _record(checkpoint, page, videos)
-            if job.verbose:
-                log(f"Page {page} finished in {time.monotonic() - started[page]:.1f}s", "dim")
-    finally:
-        # Do not wait for unfinished tasks if the user pressed Ctrl+C.
-        executor.shutdown(wait=False, cancel_futures=True)
-
-    if not failed:
-        return []
-    failed.sort()
-    log(f"Retrying {len(failed)} failed pages: {failed}", "warn")
-    # Retry each failed page once, one at a time.
-    return [page for page in failed if not _fetch_and_record(pool, job, checkpoint, page)]
-
-
-def _verify_end(pool, job, checkpoint, page):
-    # Probe pages after the estimated last page until one is empty or repeats the previous page.
-    previous = None
-    while page <= SAFETY_PAGE_LIMIT:
-        url = page_url(job.url, page)
-        videos = fetch_page(pool, url, job.retries)
-        if videos == []:
-            # Check an empty page once more in case the site was just slow to render.
-            videos = fetch_page(pool, url, job.retries)
-        if videos is None:
-            log(f"Verification stopped, page {page} failed.", "error")
-            return False
-        if not videos:
-            log(f"Page {page} is empty, last page is {page - 1}.", "success")
-            return True
-        # Some sites show the last page again for out-of-range numbers. Stop when that happens.
-        urls = {video["url"] for video in videos}
-        if urls == previous:
-            log(f"Page {page} repeats the previous page, last page is {page - 1}.", "success")
-            return True
-        previous = urls
-        _record(checkpoint, page, videos)
-        page += 1
-    log("Reached the safety page limit.", "warn")
-    return False
-
-
-def run(job, pool):
-    # Main flow: load checkpoint, find last page, fetch, verify, save, and clean up.
+def run(job):
+    # Load checkpoint, crawl, save output, and clean up.
     started = time.monotonic()
     checkpoint = Checkpoint(job.checkpoint_path, job.url)
     if job.fresh:
         checkpoint.discard()
     else:
         checkpoint.load()
+        if checkpoint.covers_listing():
+            log("Checkpoint already covers the whole listing. Use -n to fetch it again.", "info")
 
-    # Step 1: estimate how many pages exist.
-    log("Detecting last page...", "step")
-    candidate = detect_last_page(pool, page_url(job.url, 1), job.retries)
-    log(f"Estimated last page: {candidate}", "info")
+    complete, error = crawl(job, checkpoint)
+    if error:
+        log(error, "error")
 
-    # Step 2: page 1 is required. Stop if it fails.
-    if 1 not in checkpoint.pages and not _fetch_and_record(pool, job, checkpoint, 1):
-        raise RuntimeError("page 1 failed after all retries, checkpoint kept")
-
-    # Step 3: fetch the remaining pages that are not already in the checkpoint.
-    last_known = max([candidate, *checkpoint.pages])
-    pending = [page for page in range(2, last_known + 1) if page not in checkpoint.pages]
-    missing = _fetch_pages(pool, job, checkpoint, pending)
-
-    # Step 4: check for pages beyond the estimate.
-    log("Verifying end of pagination...", "step")
-    verified = _verify_end(pool, job, checkpoint, last_known + 1)
-    complete = verified and not missing
-    if missing:
-        log(f"These pages still failed and are missing from the results: {missing}", "error")
-
-    # Step 5: shape the data and save it if an output path was given.
     fieldnames = fieldnames_for(job.fields)
     records = _shape(checkpoint.videos, job.fields)
     saved = False
@@ -815,7 +691,6 @@ def run(job, pool):
         log(f"Saved to {job.output}", "success")
         saved = True
 
-    # Step 6: decide whether to delete the checkpoint.
     if not records:
         log("No videos were extracted. Check the URL, network, or site structure.", "warn")
     if not complete:
@@ -883,7 +758,7 @@ def parse_args(argv=None):
     )
     cli.add_argument(
         "-w", "--workers", type=_bounded(1, MAX_WORKERS),
-        help=f"parallel workers, 1-{MAX_WORKERS} (default: {DEFAULT_WORKERS})",
+        help=f"parallel requests, 1-{MAX_WORKERS} (default: {DEFAULT_WORKERS})",
     )
     cli.add_argument(
         "-r", "--retries", type=_bounded(1, MAX_RETRIES),
@@ -903,7 +778,7 @@ def parse_args(argv=None):
     )
     cli.add_argument(
         "-v", "--verbose", action="store_true",
-        help="show the time taken for each page",
+        help="show the time taken for each batch of pages",
     )
 
     args = parser.parse_args(argv)
@@ -1096,12 +971,11 @@ def main(argv=None):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     args = parse_args(argv)
-    pool = DriverPool()
     try:
         job = interactive_job() if args.interactive else job_from_args(args)
         if job.output is not None:
             ensure_output_ready(job.output, job.fmt)
-        outcome = run(job, pool)
+        outcome = run(job)
     except KeyboardInterrupt:
         print(flush=True)
         log("Stopped by user. Run again to resume.", "warn")
@@ -1116,9 +990,6 @@ def main(argv=None):
     except Exception as exc:
         log(f"Fatal error: {type(exc).__name__}: {exc}", "error")
         return 1
-    finally:
-        # Always close Chrome, even when there was an error.
-        pool.close()
 
     print_summary(outcome, job)
     return 0 if outcome.complete else 1
