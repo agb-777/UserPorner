@@ -79,16 +79,22 @@ HEADERS = {
 
 # Characters that have a meaning in Markdown and must be escaped inside table cells.
 _MD_SPECIAL = str.maketrans({char: "\\" + char for char in "\\`*_[]<>|"})
+# Control characters that are not whitespace. They can break PDF generation.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0e-\x1b\x7f]")
+# A CSV cell starting with one of these may be run as a formula by spreadsheet programs.
+_CSV_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
 
 # Reasons used in log messages when a page marks the end of the listing.
 END_REASONS = {"missing": "does not exist", "end": "is empty"}
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging and stop signal
 # ---------------------------------------------------------------------------
 
 # Lock so messages from several threads do not mix on one line.
 _LOG_LOCK = threading.Lock()
+# Set when the program is stopping, so worker threads quit without finishing every retry.
+_STOP = threading.Event()
 _LOG_STYLES = {
     "info": (Fore.CYAN, "*"),
     "success": (Fore.GREEN, "+"),
@@ -158,8 +164,8 @@ def _is_listing(final_url, number):
 # ---------------------------------------------------------------------------
 
 def _clean(value):
-    # Collapse whitespace and newlines into single spaces.
-    return " ".join(str(value).split())
+    # Remove control characters and collapse whitespace and newlines into single spaces.
+    return " ".join(_CONTROL_CHARS.sub(" ", str(value)).split())
 
 
 def _urls(videos):
@@ -251,7 +257,7 @@ class PageResult:
     #   "ok"       the page has videos
     #   "end"      the page is a real listing with no videos, confirmed over every attempt
     #   "missing"  the page does not exist (404 or redirect), confirmed over every attempt
-    #   "fail"     the page could not be read after all attempts
+    #   "fail"     the page could not be read after all attempts, or the program is stopping
     kind: str
     videos: list | None = None
     reason: str = ""
@@ -281,15 +287,19 @@ def fetch_page(base, number, attempts):
     missing_votes = 0
     empty_votes = 0
     for attempt in range(1, attempts + 1):
-        time.sleep(REQUEST_DELAY)
+        # Waiting on the stop event instead of sleeping lets Ctrl+C end workers quickly.
+        if _STOP.wait(REQUEST_DELAY):
+            return PageResult("fail", reason="stopped")
         vote = None
         try:
             final_url, raw, charset = _download(url)
         except urllib.error.HTTPError as exc:
-            if exc.code == 404:
+            code = exc.code
+            exc.close()
+            if code == 404:
                 vote = "missing"
             else:
-                reason = f"HTTP {exc.code}"
+                reason = f"HTTP {code}"
         except Exception as exc:
             # Covers timeouts, connection resets, and incomplete reads.
             reason = type(exc).__name__
@@ -316,11 +326,15 @@ def fetch_page(base, number, attempts):
         elif vote == "empty":
             empty_votes += 1
 
+        if _STOP.is_set():
+            return PageResult("fail", reason="stopped")
+
         # Only real problems are logged. A normal end of the listing is confirmed quietly.
         if attempt < attempts:
             if vote is None:
                 log(f"Attempt {attempt}/{attempts} failed ({reason}): {url}", "warn")
-            time.sleep(RETRY_DELAY * attempt)
+            if _STOP.wait(RETRY_DELAY * attempt):
+                return PageResult("fail", reason="stopped")
 
     if missing_votes == attempts:
         return PageResult("missing")
@@ -377,6 +391,10 @@ class Checkpoint:
             for video in self.pages[number]:
                 unique.setdefault(video["url"], video)
         return list(unique.values())
+
+    def known_urls(self):
+        # Every video URL stored so far.
+        return {video["url"] for page in self.pages.values() for video in page}
 
     def covers_listing(self):
         # True when the end is known and every page up to it is stored.
@@ -441,6 +459,7 @@ class Checkpoint:
         }
         tmp = self.path.with_name(self.path.name + ".tmp")
         try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             tmp.replace(self.path)
         except OSError as exc:
@@ -451,10 +470,10 @@ class Checkpoint:
 # Crawling
 # ---------------------------------------------------------------------------
 
-def _same_as_previous(checkpoint, number, videos):
-    # Some sites repeat the last page for out-of-range numbers. Detect that by comparing URLs.
-    previous = checkpoint.pages.get(number - 1)
-    return previous is not None and _urls(previous) == _urls(videos)
+def _already_seen(checkpoint, videos):
+    # Some sites repeat earlier content for out-of-range page numbers.
+    # A page whose videos were all collected before is a repeat, not new content.
+    return bool(videos) and _urls(videos) <= checkpoint.known_urls()
 
 
 def crawl(job, checkpoint):
@@ -475,7 +494,7 @@ def crawl(job, checkpoint):
             batch = list(range(first, first + job.workers))
 
         began = time.monotonic()
-        log(f"Fetching pages {batch[0]}-{batch[-1]} with {job.workers} workers...", "step")
+        log(f"Fetching pages {batch[0]}-{batch[-1]}...", "step")
         results = _fetch_batch(job, batch)
         if job.verbose:
             log(f"Batch finished in {time.monotonic() - began:.1f}s", "dim")
@@ -486,16 +505,18 @@ def crawl(job, checkpoint):
                 return False, f"page {number} failed ({result.reason}), run again to resume"
 
             ends_listing = result.kind in END_REASONS or (
-                result.kind == "ok" and _same_as_previous(checkpoint, number, result.videos)
+                result.kind == "ok" and _already_seen(checkpoint, result.videos)
             )
             if ends_listing:
                 # A checkpoint already knows where the listing ends. If that changed, do not shrink
                 # the listing silently, because that would drop videos from the output.
                 if checkpoint.last_page is not None:
                     return False, f"page {number} no longer matches the checkpoint, run with -n to start over"
-                if number == 1 and result.kind == "missing":
-                    return False, "profile page not found or redirected, check the URL"
-                reason = END_REASONS.get(result.kind, "repeats the previous page")
+                # An empty first page is never trusted as a finished listing. It usually means a wrong
+                # username or a changed page layout.
+                if number == 1:
+                    return False, "page 1 has no videos or does not exist, check the username or the page layout"
+                reason = END_REASONS.get(result.kind, "repeats earlier pages")
                 checkpoint.set_last_page(number - 1)
                 log(f"Page {number} {reason}, last page is {number - 1}.", "success")
                 break
@@ -513,13 +534,19 @@ def _md_text(value):
     return _clean(value).translate(_MD_SPECIAL)
 
 
+def _csv_safe(value):
+    # Stop spreadsheet programs from running a title as a formula.
+    return "'" + value if value.startswith(_CSV_TRIGGERS) else value
+
+
 def _write_csv(path, records, fieldnames, metadata):
     # CSV has no room for metadata without breaking the table, so only records are written.
     # utf-8-sig adds a BOM so Excel reads non-Latin characters correctly.
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(records)
+        for record in records:
+            writer.writerow({key: _csv_safe(value) for key, value in record.items()})
 
 
 def _write_json(path, records, fieldnames, metadata):
@@ -768,10 +795,17 @@ def run(job):
 
     fieldnames = fieldnames_for(job.fields)
     records = _shape(checkpoint.videos, job.fields)
+    # A listing with no videos is never reported as complete.
+    complete = complete and bool(records)
     saved = False
 
-    if job.output is None:
+    if not records:
+        log("No videos were extracted, so nothing was saved. Check the URL, network, or site structure.", "warn")
+    elif job.output is None:
         log("No output path given, results were not saved.", "warn")
+    elif not complete and job.output.exists():
+        # An unfinished run must not replace a file that may hold a complete earlier result.
+        log(f"Results are incomplete and {job.output} already exists, so it was not overwritten.", "warn")
     else:
         metadata = {
             "source_url": job.url,
@@ -785,9 +819,6 @@ def run(job):
         save_records(job.output, job.fmt, records, fieldnames, metadata)
         log(f"Saved to {job.output}", "success")
         saved = True
-
-    if not records:
-        log("No videos were extracted. Check the URL, network, or site structure.", "warn")
 
     # The checkpoint is only deleted when the run is complete AND the results are in a file.
     # Otherwise it is the only copy of the data, so it stays.
@@ -905,6 +936,8 @@ def parse_args(argv=None):
         parser.error("-u/--url is required unless -i is used")
     if normalize_profile_url(args.url) is None:
         parser.error("-u/--url must be an Eporner profile URL or a username")
+    if args.output is not None and not args.output.strip():
+        parser.error("-o/--output must not be empty")
 
     # Fill in defaults for anything the user did not set.
     args.format = args.format or DEFAULT_FORMAT
@@ -990,11 +1023,22 @@ def _ask_url():
         print(f"{Fore.YELLOW}Enter an Eporner profile URL or a username.{Style.RESET_ALL}")
 
 
+def _ask_output():
+    # Ask for the output file. An empty answer means do not save. A folder name is refused.
+    while True:
+        raw = _ask("Output file (empty = do not save)")
+        if not raw:
+            return ""
+        if Path(raw).name not in ("", ".", ".."):
+            return raw
+        print(f"{Fore.YELLOW}Enter a file name, not a folder.{Style.RESET_ALL}")
+
+
 def interactive_job():
     # Ask for settings in order. Format and fields are only asked if there is an output file.
     print(f"{Fore.CYAN}{Style.BRIGHT}Interactive mode{Style.RESET_ALL}")
     url = _ask_url()
-    output = _ask("Output file (empty = do not save)")
+    output = _ask_output()
     fmt, fields = DEFAULT_FORMAT, DEFAULT_FIELDS
     if output:
         fmt = _ask_choice("Format", FORMATS, DEFAULT_FORMAT)
@@ -1026,12 +1070,17 @@ def print_summary(outcome, job):
         if outcome.complete
         else f"{Fore.RED}INCOMPLETE{Style.RESET_ALL}"
     )
-    saved = str(outcome.output) if outcome.output else "not saved (use -o)"
+    if outcome.output:
+        saved = str(outcome.output)
+    elif job.output:
+        saved = "not saved (see messages above)"
+    else:
+        saved = "not saved (use -o)"
     print()
     print(f"Source  : {job.url}")
     print(f"Records : {len(outcome.records)}")
     print(f"Output  : {saved}")
-    print(f"Format  : {outcome.fmt}")
+    print(f"Format  : {outcome.fmt if outcome.output else '-'}")
     print(f"Fields  : {', '.join(outcome.fieldnames)}")
     print(f"Elapsed : {outcome.elapsed:.1f}s")
     print(f"Status  : {status}")
@@ -1042,11 +1091,12 @@ def print_summary(outcome, job):
 # ---------------------------------------------------------------------------
 
 def main(argv=None):
-    # Set up terminal colors and UTF-8 output, then run the scraper.
+    # Set up UTF-8 output and terminal colors, then run the scraper.
     # Return the exit code.
-    init(autoreset=True)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    init(autoreset=True)
+    _STOP.clear()
 
     args = parse_args(argv)
     try:
@@ -1068,6 +1118,9 @@ def main(argv=None):
     except Exception as exc:
         log(f"Fatal error: {type(exc).__name__}: {exc}", "error")
         return 1
+    finally:
+        # Tell any worker thread that is still running to stop.
+        _STOP.set()
 
     print_summary(outcome, job)
     return 0 if outcome.complete else 1
