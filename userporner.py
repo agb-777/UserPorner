@@ -114,6 +114,12 @@ def page_number(url):
     return int(match.group(1)) if match else 1
 
 
+def _is_listing(final_url, number):
+    # A response only counts as page N if it is a listing URL for that same page number.
+    # A redirect to the home page or another section is not a listing.
+    return LISTING_MARKER in final_url and page_number(final_url) == number
+
+
 # ---------------------------------------------------------------------------
 # HTML parsing
 # ---------------------------------------------------------------------------
@@ -206,57 +212,80 @@ def parse_videos(html, page_url_value):
 class PageResult:
     # kind is one of:
     #   "ok"       the page has videos
-    #   "end"      the page is a real listing with no videos, confirmed over every retry
-    #   "missing"  the page does not exist (404) or redirected to another page
-    #   "fail"     the page could not be read after all retries
+    #   "end"      the page is a real listing with no videos, confirmed over every attempt
+    #   "missing"  the page does not exist (404 or redirect), confirmed over every attempt
+    #   "fail"     the page could not be read after all attempts
     kind: str
     videos: list | None = None
     reason: str = ""
 
 
 def _download(url):
-    # Download one page and return (final URL after redirects, decoded HTML).
+    # Download one page. Return (final URL after redirects, raw bytes, declared charset).
     request = urllib.request.Request(url, headers=HEADERS)
     with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-        charset = response.headers.get_content_charset() or "utf-8"
-        html = response.read().decode(charset, errors="replace")
-        return response.geturl(), html
+        return response.geturl(), response.read(), response.headers.get_content_charset()
 
 
-def fetch_page(base, number, retries):
-    # Fetch one listing page with retries. Return a PageResult.
+def _decode(raw, charset):
+    # Decode the body. Fall back to UTF-8 if the server declares a charset Python does not know.
+    try:
+        return raw.decode(charset or "utf-8", errors="replace")
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
+
+
+def fetch_page(base, number, attempts):
+    # Fetch one listing page with up to `attempts` tries. Return a PageResult.
+    # "Missing" and "empty" are only trusted when every attempt agrees, so a single
+    # transient error cannot end the listing early.
     url = page_url(base, number)
     reason = "unknown"
-    for attempt in range(1, retries + 1):
+    missing_votes = 0
+    empty_votes = 0
+    for attempt in range(1, attempts + 1):
         time.sleep(REQUEST_DELAY)
+        vote = None
         try:
-            final_url, html = _download(url)
+            final_url, raw, charset = _download(url)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
-                return PageResult("missing")
-            reason = f"HTTP {exc.code}"
+                vote = "missing"
+            else:
+                reason = f"HTTP {exc.code}"
         except Exception as exc:
-            # Covers timeouts, connection resets, incomplete reads, and unknown charsets.
+            # Covers timeouts, connection resets, and incomplete reads.
             reason = type(exc).__name__
         else:
-            # A missing page number is often redirected to another page.
-            if page_number(final_url) != number:
-                return PageResult("missing")
-            videos = parse_videos(html, final_url)
-            if videos:
-                return PageResult("ok", videos)
-            if LISTING_MARKER in html:
-                # An empty listing only counts as the end if every attempt agrees.
-                reason = "empty listing"
-                if attempt == retries:
-                    return PageResult("end")
+            html = _decode(raw, charset)
+            if not _is_listing(final_url, number):
+                vote = "missing"
             else:
-                # Anything else, such as a challenge or error page, is a failure, never the end.
-                reason = "unexpected page content"
-        if attempt < retries:
-            log(f"Attempt {attempt}/{retries} failed ({reason}): {url}", "warn")
+                videos = parse_videos(html, final_url)
+                if videos:
+                    return PageResult("ok", videos)
+                if LISTING_MARKER in html:
+                    vote = "empty"
+                else:
+                    # Anything else, such as a challenge or error page, is a failure, never the end.
+                    reason = "unexpected page content"
+
+        if vote == "missing":
+            missing_votes += 1
+            reason = "page not found"
+        elif vote == "empty":
+            empty_votes += 1
+            reason = "empty listing"
+
+        if attempt < attempts:
+            log(f"Attempt {attempt}/{attempts} failed ({reason}): {url}", "warn")
             time.sleep(RETRY_DELAY * attempt)
-    log(f"All {retries} attempts failed: {url}", "error")
+
+    if missing_votes == attempts:
+        return PageResult("missing")
+    if empty_votes == attempts:
+        return PageResult("end")
+    log(f"All {attempts} attempts failed: {url}", "error")
     return PageResult("fail", reason=reason)
 
 
@@ -264,7 +293,7 @@ def _fetch_batch(job, batch):
     # Fetch several pages at once. Results come back in the same order as the batch.
     executor = ThreadPoolExecutor(max_workers=job.workers)
     try:
-        return list(executor.map(lambda number: fetch_page(job.url, number, job.retries), batch))
+        return list(executor.map(lambda number: fetch_page(job.url, number, job.attempts), batch))
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
 
@@ -623,7 +652,7 @@ class Job:
     fmt: str
     fields: str
     workers: int
-    retries: int
+    attempts: int  # Tries per page before it is reported as failed.
     checkpoint_path: Path
     keep_checkpoint: bool
     fresh: bool  # True means delete the old checkpoint first.
@@ -728,7 +757,10 @@ def _bounded(low, high):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         prog="userporner.py",
-        description="Scrape video listings from an Eporner profile.",
+        description=(
+            "Scrape video listings from an Eporner profile.\n"
+            f"author: {AUTHOR}  |  homepage: {HOMEPAGE}"
+        ),
         epilog=(
             "examples:\n"
             "  python userporner.py -u https://www.eporner.com/profile/NAME/ -o hasil -f md\n"
@@ -762,7 +794,7 @@ def parse_args(argv=None):
     )
     cli.add_argument(
         "-r", "--retries", type=_bounded(1, MAX_RETRIES),
-        help=f"retries per page, 1-{MAX_RETRIES} (default: {DEFAULT_RETRIES})",
+        help=f"attempts per page, 1-{MAX_RETRIES} (default: {DEFAULT_RETRIES})",
     )
     cli.add_argument(
         "-c", "--checkpoint",
@@ -817,7 +849,7 @@ def parse_args(argv=None):
     return args
 
 
-def make_job(url, fmt, fields, output, workers, retries, checkpoint, keep_checkpoint, fresh, verbose):
+def make_job(url, fmt, fields, output, workers, attempts, checkpoint, keep_checkpoint, fresh, verbose):
     # Build a Job from plain values. Used by both CLI and interactive mode.
     return Job(
         url=url,
@@ -825,7 +857,7 @@ def make_job(url, fmt, fields, output, workers, retries, checkpoint, keep_checkp
         fmt=fmt,
         fields=fields,
         workers=workers,
-        retries=retries,
+        attempts=attempts,
         checkpoint_path=Path(checkpoint),
         keep_checkpoint=keep_checkpoint,
         fresh=fresh,
@@ -841,7 +873,7 @@ def job_from_args(args):
         fields=args.fields,
         output=args.output,
         workers=args.workers,
-        retries=args.retries,
+        attempts=args.retries,
         checkpoint=args.checkpoint,
         keep_checkpoint=args.keep_checkpoint,
         fresh=args.no_resume,
@@ -902,14 +934,14 @@ def interactive_job():
         fmt = _ask_choice("Format", FORMATS, DEFAULT_FORMAT)
         fields = _ask_choice("Fields", FIELD_CHOICES, DEFAULT_FIELDS)
     workers = _ask_int("Workers", DEFAULT_WORKERS, 1, MAX_WORKERS)
-    retries = _ask_int("Retries", DEFAULT_RETRIES, 1, MAX_RETRIES)
+    attempts = _ask_int("Attempts per page", DEFAULT_RETRIES, 1, MAX_RETRIES)
     return make_job(
         url=url,
         fmt=fmt,
         fields=fields,
         output=output or None,
         workers=workers,
-        retries=retries,
+        attempts=attempts,
         checkpoint=DEFAULT_CHECKPOINT,
         keep_checkpoint=False,
         fresh=False,
