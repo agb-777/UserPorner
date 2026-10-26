@@ -31,7 +31,8 @@ from colorama import Fore, Style, init
 AUTHOR = "agb-777"
 HOMEPAGE = "https://github.com/agb-777/userporner"
 
-DEFAULT_CHECKPOINT = ".scraper_checkpoint.json"
+# Each profile gets its own checkpoint file, so two profiles never overwrite each other.
+CHECKPOINT_TEMPLATE = ".scraper_checkpoint_{}.json"
 DEFAULT_FORMAT = "csv"
 DEFAULT_FIELDS = "all"
 DEFAULT_WORKERS = 3
@@ -40,10 +41,14 @@ FORMATS = ("csv", "json", "md", "pdf")
 FIELD_CHOICES = ("all", "url")
 FIELD_LABELS = {"title": "Title", "url": "URL"}
 
-# Accepts a full profile URL, with or without scheme and www, and captures the username.
-PROFILE_PATTERN = re.compile(r"(?:https?://)?(?:www\.)?eporner\.com/profile/([^/?#]+)", re.IGNORECASE)
-# A bare username: letters, digits, underscore, dot, and dash only.
-USERNAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]+")
+# A username: letters, digits, underscore, dash, with single dots between parts.
+USERNAME = r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*"
+USERNAME_PATTERN = re.compile(USERNAME)
+# A full profile URL, with optional scheme and www. Captures the username.
+PROFILE_PATTERN = re.compile(
+    rf"^(?:https?://)?(?:www\.)?eporner\.com/profile/({USERNAME})(?:[/?#]|$)",
+    re.IGNORECASE,
+)
 # Matches a listing page number such as /uploaded-videos/3/.
 PAGE_PATTERN = re.compile(r"/uploaded-videos/(\d+)(?:[/?#]|$)")
 # Every video link contains this text.
@@ -71,6 +76,12 @@ HEADERS = {
     "Accept-Encoding": "identity",  # urllib does not decompress gzip, so ask for plain HTML.
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+# Characters that have a meaning in Markdown and must be escaped inside table cells.
+_MD_SPECIAL = str.maketrans({char: "\\" + char for char in "\\`*_[]<>|"})
+
+# Reasons used in log messages when a page marks the end of the listing.
+END_REASONS = {"missing": "does not exist", "end": "is empty"}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -103,7 +114,7 @@ def log(message, level="info"):
 def normalize_profile_url(raw):
     # Accept a full profile URL or a bare username. Return the listing URL, or None if invalid.
     text = (raw or "").strip()
-    match = PROFILE_PATTERN.search(text)
+    match = PROFILE_PATTERN.match(text)
     if match is not None:
         username = match.group(1)
     elif USERNAME_PATTERN.fullmatch(text):
@@ -111,6 +122,12 @@ def normalize_profile_url(raw):
     else:
         return None
     return f"https://www.eporner.com/profile/{username}/uploaded-videos/"
+
+
+def checkpoint_name(listing_url):
+    # Build the default checkpoint file name for one profile.
+    username = listing_url.split("/profile/", 1)[1].split("/", 1)[0]
+    return CHECKPOINT_TEMPLATE.format(username)
 
 
 def page_url(base, number):
@@ -296,20 +313,20 @@ def fetch_page(base, number, attempts):
 
         if vote == "missing":
             missing_votes += 1
-            reason = "page not found"
         elif vote == "empty":
             empty_votes += 1
-            reason = "empty listing"
 
+        # Only real problems are logged. A normal end of the listing is confirmed quietly.
         if attempt < attempts:
-            log(f"Attempt {attempt}/{attempts} failed ({reason}): {url}", "warn")
+            if vote is None:
+                log(f"Attempt {attempt}/{attempts} failed ({reason}): {url}", "warn")
             time.sleep(RETRY_DELAY * attempt)
 
     if missing_votes == attempts:
         return PageResult("missing")
     if empty_votes == attempts:
         return PageResult("end")
-    log(f"All {attempts} attempts failed: {url}", "error")
+    log(f"All {attempts} attempts failed ({reason}): {url}", "error")
     return PageResult("fail", reason=reason)
 
 
@@ -434,15 +451,21 @@ class Checkpoint:
 # Crawling
 # ---------------------------------------------------------------------------
 
+def _same_as_previous(checkpoint, number, videos):
+    # Some sites repeat the last page for out-of-range numbers. Detect that by comparing URLs.
+    previous = checkpoint.pages.get(number - 1)
+    return previous is not None and _urls(previous) == _urls(videos)
+
+
 def crawl(job, checkpoint):
     # Fetch pages in parallel batches until the end of the listing is confirmed.
     # Return (complete, error_message).
     while True:
         if checkpoint.last_page is not None:
-            missing = [n for n in range(1, checkpoint.last_page + 1) if n not in checkpoint.pages]
-            if not missing:
+            pending = [n for n in range(1, checkpoint.last_page + 1) if n not in checkpoint.pages]
+            if not pending:
                 return True, ""
-            batch = missing[: job.workers]
+            batch = pending[: job.workers]
         else:
             first = 1
             while first in checkpoint.pages:
@@ -461,22 +484,22 @@ def crawl(job, checkpoint):
         for number, result in zip(batch, results):
             if result.kind == "fail":
                 return False, f"page {number} failed ({result.reason}), run again to resume"
-            if result.kind == "missing":
-                if number == 1:
+
+            ends_listing = result.kind in END_REASONS or (
+                result.kind == "ok" and _same_as_previous(checkpoint, number, result.videos)
+            )
+            if ends_listing:
+                # A checkpoint already knows where the listing ends. If that changed, do not shrink
+                # the listing silently, because that would drop videos from the output.
+                if checkpoint.last_page is not None:
+                    return False, f"page {number} no longer matches the checkpoint, run with -n to start over"
+                if number == 1 and result.kind == "missing":
                     return False, "profile page not found or redirected, check the URL"
+                reason = END_REASONS.get(result.kind, "repeats the previous page")
                 checkpoint.set_last_page(number - 1)
-                log(f"Page {number} does not exist, last page is {number - 1}.", "success")
+                log(f"Page {number} {reason}, last page is {number - 1}.", "success")
                 break
-            if result.kind == "end":
-                checkpoint.set_last_page(number - 1)
-                log(f"Page {number} is empty, last page is {number - 1}.", "success")
-                break
-            previous = checkpoint.pages.get(number - 1)
-            if previous is not None and _urls(previous) == _urls(result.videos):
-                # Some sites repeat the last page for out-of-range numbers.
-                checkpoint.set_last_page(number - 1)
-                log(f"Page {number} repeats the previous page, last page is {number - 1}.", "success")
-                break
+
             checkpoint.record(number, result.videos)
             log(f"Page {number}: {len(result.videos)} videos", "success")
 
@@ -484,6 +507,11 @@ def crawl(job, checkpoint):
 # ---------------------------------------------------------------------------
 # Output writers
 # ---------------------------------------------------------------------------
+
+def _md_text(value):
+    # Make text safe for a Markdown table cell.
+    return _clean(value).translate(_MD_SPECIAL)
+
 
 def _write_csv(path, records, fieldnames, metadata):
     # CSV has no room for metadata without breaking the table, so only records are written.
@@ -519,9 +547,12 @@ def _write_md(path, records, fieldnames, metadata):
     for index, record in enumerate(records, start=1):
         cells = [str(index)]
         for name in fieldnames:
-            # Escape pipes so they do not break the table.
-            value = _clean(record[name]).replace("|", "\\|")
-            cells.append(f"<{value}>" if name == "url" else value)
+            if name == "url":
+                # A pipe would break the table, so it is replaced with its percent-encoded form.
+                url = _clean(record[name]).replace("|", "%7C")
+                cells.append(f"<{url}>")
+            else:
+                cells.append(_md_text(record[name]))
         lines.append("| " + " | ".join(cells) + " |")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -650,6 +681,8 @@ def save_records(path, fmt, records, fieldnames, metadata):
 def resolve_output(raw, fmt):
     # Add the format extension if the user did not type it.
     path = Path(raw)
+    if not path.name or path.name in (".", ".."):
+        raise ValueError("output must be a file name, not a folder")
     if path.suffix.lower() == f".{fmt}":
         return path
     return path.with_name(path.name + f".{fmt}")
@@ -719,7 +752,7 @@ def _shape(videos, fields):
 # ---------------------------------------------------------------------------
 
 def run(job):
-    # Load checkpoint, crawl, save output, and clean up.
+    # Load checkpoint, crawl, save output, and decide what to keep.
     started = time.monotonic()
     checkpoint = Checkpoint(job.checkpoint_path, job.url)
     if job.fresh:
@@ -756,10 +789,12 @@ def run(job):
     if not records:
         log("No videos were extracted. Check the URL, network, or site structure.", "warn")
 
-    # The checkpoint is removed after a complete run, unless -k asks to keep it.
-    # An incomplete run always keeps it, so the next run can continue.
+    # The checkpoint is only deleted when the run is complete AND the results are in a file.
+    # Otherwise it is the only copy of the data, so it stays.
     if not complete:
         log("Results are incomplete. Checkpoint kept, run again to continue.", "warn")
+    elif not saved:
+        log("Checkpoint kept, because the results are not saved to a file yet.", "info")
     elif job.keep_checkpoint:
         log("Checkpoint kept (-k).", "info")
     else:
@@ -787,6 +822,8 @@ def _bounded(low, high):
             raise argparse.ArgumentTypeError(f"must be between {low} and {high}")
         return value
 
+    # argparse uses this name in its error message, for example "invalid integer 1-10 value".
+    parse.__name__ = f"integer {low}-{high}"
     return parse
 
 
@@ -827,7 +864,7 @@ def parse_args(argv=None):
     )
     cli.add_argument(
         "-c", "--checkpoint",
-        help=f"checkpoint file path (default: {DEFAULT_CHECKPOINT})",
+        help="checkpoint file path (default: .scraper_checkpoint_<username>.json)",
     )
     cli.add_argument(
         "-n", "--no-resume", action="store_true",
@@ -874,7 +911,6 @@ def parse_args(argv=None):
     args.fields = args.fields or DEFAULT_FIELDS
     args.workers = args.workers or DEFAULT_WORKERS
     args.retries = args.retries or DEFAULT_RETRIES
-    args.checkpoint = args.checkpoint or DEFAULT_CHECKPOINT
     return args
 
 
@@ -896,14 +932,15 @@ def make_job(url, fmt, fields, output, workers, attempts, checkpoint, keep_check
 
 def job_from_args(args):
     # Convert parsed CLI arguments into a Job.
+    url = normalize_profile_url(args.url)
     return make_job(
-        url=normalize_profile_url(args.url),
+        url=url,
         fmt=args.format,
         fields=args.fields,
         output=args.output,
         workers=args.workers,
         attempts=args.retries,
-        checkpoint=args.checkpoint,
+        checkpoint=args.checkpoint or checkpoint_name(url),
         keep_checkpoint=args.keep_checkpoint,
         fresh=args.no_resume,
         verbose=args.verbose,
@@ -971,7 +1008,7 @@ def interactive_job():
         output=output or None,
         workers=workers,
         attempts=attempts,
-        checkpoint=DEFAULT_CHECKPOINT,
+        checkpoint=checkpoint_name(url),
         keep_checkpoint=False,
         fresh=False,
         verbose=False,
