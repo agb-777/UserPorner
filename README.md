@@ -62,10 +62,16 @@ Save the video list as a text file. The default format is `txt`:
 python userporner.py -u USERNAME -o result
 ```
 
-Save as an HTML page with thumbnails shown as pictures:
+Save as an HTML page with thumbnails shown as pictures, 20 videos per page:
 
 ```bash
-python userporner.py -u USERNAME -o result -f html
+python userporner.py -u USERNAME -o result -f html -p 20
+```
+
+Save as a Markdown table. The name must end in `.md` or have no extension:
+
+```bash
+python userporner.py -u USERNAME -o result.md -f md
 ```
 
 Save only the URLs as CSV:
@@ -105,11 +111,12 @@ No output file is written unless `-o` is given. Progress files are only written 
 | Option | Default | Description |
 |---|---|---|
 | `-u`, `--url` | required | Profile URL or username |
-| `-o`, `--output` | none | Output file. The extension is added from `-f` if missing |
+| `-o`, `--output` | none | Output file. The extension is added from `-f` if missing. If you type an extension, it must match `-f` |
 | `-f`, `--format` | `txt` | `txt`, `csv`, `json`, `md`, `html`, or `pdf` |
 | `-F`, `--fields` | `all` | `all` (title, thumbnail, views, URL) or `url` (URL only) |
+| `-p`, `--per-page` | `50` | Rows per page in HTML output, 1 to 500. Only works with `-f html` |
 | `-w`, `--workers` | `3` | Parallel requests, 1 to 10 |
-| `-r`, `--retries` | `3` | Attempts per page, 1 to 10 |
+| `-r`, `--retries` | `3` | Attempts per page, 2 to 10. At least 2, so an empty or missing page must be seen twice before the listing ends |
 | `-s`, `--save-checkpoint` | none | Save progress to FILE after every page |
 | `-R`, `--resume` | none | Continue from a FILE made with `-s` |
 | `-v`, `--verbose` | off | Show time per batch of pages |
@@ -120,16 +127,17 @@ No output file is written unless `-o` is given. Progress files are only written 
 | Format | Thumbnail | Notes |
 |---|---|---|
 | `txt` | URL as text | Plain text, one block per video |
-| `csv` | URL as text | Records only, opens in Excel |
-| `json` | URL as text | Metadata and records |
-| `md` | Picture | Markdown table. Pictures load from the Eporner CDN when viewed |
-| `html` | Picture | Styled page, follows light or dark mode. Pictures load from the Eporner CDN when viewed |
-| `pdf` | Picture | Downloads the thumbnails first. Only JPEG and PNG up to 1 MB are embedded. Others show `-` |
+| `csv` | URL as text | Records only, opens in Excel. Does not record whether the run was complete |
+| `json` | URL as text | Metadata and records, including status |
+| `md` | Picture, centered | Markdown table. Pictures load from the Eporner CDN when viewed |
+| `html` | Picture, centered | Styled page with Previous and Next buttons. Follows light or dark mode. Pictures load from the Eporner CDN when viewed |
+| `pdf` | Picture, centered | Downloads the thumbnails first. Only JPEG and PNG up to 1 MB are embedded. Others show `-` |
 
 Notes:
 
 - With `-F all`, columns are in this order: title, thumbnail, views, URL. With `-F url`, only the URL column is written.
 - Views are the count at the time of scraping, not a live value.
+- Every format except CSV records whether the run was `complete` or `incomplete`.
 
 ## Resume
 
