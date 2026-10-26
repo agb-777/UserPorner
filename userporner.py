@@ -48,7 +48,7 @@ PAGE_PATTERN = re.compile(r"/uploaded-videos/(\d+)(?:[/?#]|$)")
 VIDEO_MARKER = "/video-"
 # Text that appears in the markup of every real listing page, even when it has no videos.
 LISTING_MARKER = "/uploaded-videos/"
-# Only links on these hosts are counted as videos.
+# Only links on this site are counted as videos.
 SITE_HOST = "eporner.com"
 
 # Network settings, in seconds unless noted.
@@ -952,7 +952,7 @@ def _ask_url():
 
 def interactive_job():
     # Ask for settings in order. Format and fields are only asked if there is an output file.
-    print_banner("Interactive mode")
+    print(f"{Fore.CYAN}{Style.BRIGHT}Interactive mode{Style.RESET_ALL}")
     url = _ask_url()
     output = _ask("Output file (empty = do not save)")
     fmt, fields = DEFAULT_FORMAT, DEFAULT_FIELDS
@@ -979,42 +979,28 @@ def interactive_job():
 # Display
 # ---------------------------------------------------------------------------
 
-def print_banner(subtitle=""):
-    # Print the title box at the top of the screen.
-    width = 60
-    line = f"{Fore.BLUE}{'=' * width}{Style.RESET_ALL}"
-    print(line)
-    print(f"{Fore.CYAN}{Style.BRIGHT}{'EPORNER SCRAPER':^{width}}{Style.RESET_ALL}")
-    if subtitle:
-        print(f"{Fore.WHITE}{subtitle:^{width}}{Style.RESET_ALL}")
-    print(line)
-
-
 def print_summary(outcome, job):
-    # Print the final summary and the first five records.
-    width = 60
-    rule = f"{Fore.BLUE}{'-' * width}{Style.RESET_ALL}"
+    # Print a plain text summary with no boxes.
     status = (
-        f"{Fore.GREEN}{Style.BRIGHT}COMPLETE{Style.RESET_ALL}"
+        f"{Fore.GREEN}COMPLETE{Style.RESET_ALL}"
         if outcome.complete
-        else f"{Fore.RED}{Style.BRIGHT}INCOMPLETE{Style.RESET_ALL}"
+        else f"{Fore.RED}INCOMPLETE{Style.RESET_ALL}"
     )
-    saved = str(outcome.output) if outcome.output else f"{Fore.YELLOW}not saved (use -o){Style.RESET_ALL}"
+    saved = str(outcome.output) if outcome.output else "not saved (use -o)"
     print()
-    print_banner("Summary")
-    print(f"{Fore.CYAN}Source  {Style.RESET_ALL}: {job.url}")
-    print(f"{Fore.CYAN}Records {Style.RESET_ALL}: {Fore.GREEN}{Style.BRIGHT}{len(outcome.records)}{Style.RESET_ALL}")
-    print(f"{Fore.CYAN}Output  {Style.RESET_ALL}: {saved}")
-    print(f"{Fore.CYAN}Format  {Style.RESET_ALL}: {outcome.fmt}")
-    print(f"{Fore.CYAN}Fields  {Style.RESET_ALL}: {', '.join(outcome.fieldnames)}")
-    print(f"{Fore.CYAN}Elapsed {Style.RESET_ALL}: {outcome.elapsed:.1f}s")
-    print(f"{Fore.CYAN}Status  {Style.RESET_ALL}: {status}")
-    print(rule)
+    print(f"Source  : {job.url}")
+    print(f"Records : {len(outcome.records)}")
+    print(f"Output  : {saved}")
+    print(f"Format  : {outcome.fmt}")
+    print(f"Fields  : {', '.join(outcome.fieldnames)}")
+    print(f"Elapsed : {outcome.elapsed:.1f}s")
+    print(f"Status  : {status}")
+    print()
     for record in outcome.records[:5]:
         label = record.get("title") or record["url"]
-        print(f"{Fore.GREEN}  - {label[:60]}{Style.RESET_ALL}")
+        print(f"  - {label[:60]}")
     if len(outcome.records) > 5:
-        print(f"{Fore.WHITE}  ... and {len(outcome.records) - 5} more{Style.RESET_ALL}")
+        print(f"  ... and {len(outcome.records) - 5} more")
 
 
 # ---------------------------------------------------------------------------
